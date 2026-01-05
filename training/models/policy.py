@@ -4,11 +4,26 @@ MLP Policy network for fish control.
 Architecture:
 - Visual encoder: raycast(32) -> 32 -> 16
 - Lateral encoder: lateral(16) -> 16 -> 8
-- Proprioception: 3 features passed through directly
-- Hunger: 1 feature passed through directly
-- Combined: 28 -> 64 -> 64 -> action(2) + value(1)
+- Proprioception: 4 features passed through directly
+- Internal state: 4 features passed through directly
+- Social: 4 features passed through directly (nearest_dist, nearest_angle, num_nearby, heading_diff)
+- Combined: 36 -> 64 -> 64 -> action(3) + value(1)
 
-Total parameters: ~6,500
+Action space (3 controls - hybrid system):
+- speed [0, 1]: Desired forward speed (sigmoid)
+- direction [-1, 1]: Turn rate (tanh)
+- urgency [0, 1]: Movement intensity (sigmoid)
+
+Fin animation is computed automatically by the renderer.
+
+Observation breakdown (60 features total):
+- Raycasts: 32 (16 rays x 2 values)
+- Lateral line: 16 (8 sensors x 2 values)
+- Proprioception: 4 (vel_forward, vel_lateral, angular_vel, speed)
+- Internal: 4 (hunger, stress, social_comfort, energy)
+- Social: 4 (nearest_dist, nearest_angle, num_nearby, heading_diff)
+
+Total parameters: ~7,000
 """
 
 import numpy as np
@@ -35,9 +50,13 @@ class FishPolicy(nn.Module):
         # Input dimensions
         self.visual_dim = num_rays * 2  # 32
         self.lateral_dim = num_lateral * 2  # 16
-        self.proprio_dim = 3
-        self.hunger_dim = 1
-        self.obs_dim = self.visual_dim + self.lateral_dim + self.proprio_dim + self.hunger_dim  # 52
+        self.proprio_dim = 4  # forward vel, lateral vel, angular vel, speed
+        self.internal_dim = 4  # hunger, stress, social_comfort, energy
+        self.social_dim = 4  # nearest_dist, nearest_angle, num_nearby, heading_diff
+        self.obs_dim = (
+            self.visual_dim + self.lateral_dim + self.proprio_dim +
+            self.internal_dim + self.social_dim
+        )  # 60
 
         # Visual encoder (raycasts)
         self.visual_encoder = nn.Sequential(
@@ -55,8 +74,8 @@ class FishPolicy(nn.Module):
             nn.ReLU(),
         )
 
-        # Combined processing (16 + 8 + 3 + 1 = 28)
-        combined_dim = 16 + 8 + self.proprio_dim + self.hunger_dim
+        # Combined processing (16 + 8 + 4 + 4 + 4 = 36)
+        combined_dim = 16 + 8 + self.proprio_dim + self.internal_dim + self.social_dim
         self.combined = nn.Sequential(
             nn.Linear(combined_dim, hidden_dim),
             nn.ReLU(),
@@ -64,11 +83,11 @@ class FishPolicy(nn.Module):
             nn.ReLU(),
         )
 
-        # Action head (2 outputs: thrust mean, turn mean)
-        self.action_mean = nn.Linear(hidden_dim, 2)
+        # Action head (3 outputs: speed, direction, urgency)
+        self.action_mean = nn.Linear(hidden_dim, 3)
 
         # Learnable log std for action distribution
-        self.action_log_std = nn.Parameter(torch.zeros(2))
+        self.action_log_std = nn.Parameter(torch.zeros(3))
 
         # Value head
         self.value_head = nn.Linear(hidden_dim, 1)
@@ -96,11 +115,11 @@ class FishPolicy(nn.Module):
         Forward pass.
 
         Args:
-            obs: (batch, 52) observation tensor
+            obs: (batch, 60) observation tensor
 
         Returns:
-            action_mean: (batch, 2) action means
-            action_log_std: (2,) log standard deviations
+            action_mean: (batch, 3) action means
+            action_log_std: (3,) log standard deviations
             value: (batch, 1) state value estimate
         """
         # Split observation into components
@@ -108,18 +127,21 @@ class FishPolicy(nn.Module):
         lateral = obs[:, self.visual_dim : self.visual_dim + self.lateral_dim]
         proprio_start = self.visual_dim + self.lateral_dim
         proprio = obs[:, proprio_start : proprio_start + self.proprio_dim]
-        hunger = obs[:, -self.hunger_dim :]
+        internal_start = proprio_start + self.proprio_dim
+        internal = obs[:, internal_start : internal_start + self.internal_dim]
+        social_start = internal_start + self.internal_dim
+        social = obs[:, social_start : social_start + self.social_dim]
 
         # Encode each modality
         visual_feat = self.visual_encoder(visual)  # (batch, 16)
         lateral_feat = self.lateral_encoder(lateral)  # (batch, 8)
 
         # Combine features
-        combined = torch.cat([visual_feat, lateral_feat, proprio, hunger], dim=1)  # (batch, 28)
+        combined = torch.cat([visual_feat, lateral_feat, proprio, internal, social], dim=1)  # (batch, 36)
         hidden = self.combined(combined)  # (batch, hidden_dim)
 
         # Outputs
-        action_mean = self.action_mean(hidden)  # (batch, 2)
+        action_mean = self.action_mean(hidden)  # (batch, 3)
         value = self.value_head(hidden)  # (batch, 1)
 
         return action_mean, self.action_log_std, value
@@ -133,11 +155,11 @@ class FishPolicy(nn.Module):
         Sample action from policy.
 
         Args:
-            obs: (batch, 52) observation tensor
+            obs: (batch, 60) observation tensor
             deterministic: if True, return mean action without sampling
 
         Returns:
-            action: (batch, 2) actions with bounds applied [thrust, turn]
+            action: (batch, 3) actions with bounds applied
             log_prob: (batch,) log probabilities
             entropy: (batch,) entropy of distribution
             value: (batch, 1) state value
@@ -155,11 +177,15 @@ class FishPolicy(nn.Module):
             log_prob = dist.log_prob(unbounded_action).sum(dim=-1)
             entropy = dist.entropy().sum(dim=-1)
 
-        # Apply bounds: thrust [0, 1], turn [-1, 1]
+        # Apply bounds:
+        # speed [0, 1] - sigmoid
+        # direction [-1, 1] - tanh
+        # urgency [0, 1] - sigmoid
         action = torch.stack(
             [
-                torch.sigmoid(unbounded_action[:, 0]),  # thrust: [0, 1]
-                torch.tanh(unbounded_action[:, 1]),  # turn: [-1, 1]
+                torch.sigmoid(unbounded_action[:, 0]),  # speed: [0, 1]
+                torch.tanh(unbounded_action[:, 1]),     # direction: [-1, 1]
+                torch.sigmoid(unbounded_action[:, 2]),  # urgency: [0, 1]
             ],
             dim=1,
         )
@@ -175,8 +201,8 @@ class FishPolicy(nn.Module):
         Evaluate log probability of actions (for PPO update).
 
         Args:
-            obs: (batch, 52) observations
-            actions: (batch, 2) actions (already bounded)
+            obs: (batch, 60) observations
+            actions: (batch, 3) actions (already bounded)
 
         Returns:
             log_prob: (batch,) log probabilities
@@ -188,13 +214,15 @@ class FishPolicy(nn.Module):
 
         # Inverse transform to get unbounded actions
         # Clamp to avoid numerical issues at boundaries
-        thrust_clamped = actions[:, 0].clamp(1e-6, 1 - 1e-6)
-        turn_clamped = actions[:, 1].clamp(-1 + 1e-6, 1 - 1e-6)
+        speed_clamped = actions[:, 0].clamp(1e-6, 1 - 1e-6)
+        direction_clamped = actions[:, 1].clamp(-1 + 1e-6, 1 - 1e-6)
+        urgency_clamped = actions[:, 2].clamp(1e-6, 1 - 1e-6)
 
         unbounded = torch.stack(
             [
-                torch.logit(thrust_clamped),  # Inverse sigmoid
-                torch.atanh(turn_clamped),  # Inverse tanh
+                torch.logit(speed_clamped),        # Inverse sigmoid
+                torch.atanh(direction_clamped),    # Inverse tanh
+                torch.logit(urgency_clamped),      # Inverse sigmoid
             ],
             dim=1,
         )

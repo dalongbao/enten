@@ -2,6 +2,11 @@
 """
 Training script for digital goldfish using PPO.
 
+Supports multi-fish environments with shared policy:
+- Each fish is processed independently by the same network
+- Observations are reshaped from (envs, fish*obs_dim) to (envs*fish, obs_dim)
+- Actions are reshaped back for environment step
+
 Usage:
     python -m training.train
     python -m training.train --config training/configs/default.yaml
@@ -74,7 +79,13 @@ def compute_gae(
 
 def train(config: dict, args: argparse.Namespace):
     """Main training loop."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Device selection: MPS (Mac) > CUDA > CPU
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
 
     # Override config with command line args
@@ -83,9 +94,15 @@ def train(config: dict, args: argparse.Namespace):
 
     # Create environment
     env = make_env(config, num_envs)
-    print(f"Created {num_envs} parallel environments")
+    num_fish = env.num_fish
+    single_obs_dim = env.single_obs_dim  # 60 (per-fish observation)
+    single_action_dim = env.single_action_dim  # 3 (per-fish action)
+    total_obs_dim = num_fish * single_obs_dim
+    total_action_dim = num_fish * single_action_dim
+    print(f"Created {num_envs} parallel environments with {num_fish} fish each")
+    print(f"Per-fish obs dim: {single_obs_dim}, action dim: {single_action_dim}")
 
-    # Create policy
+    # Create policy (processes single fish observations)
     policy_config = config.get("policy", {})
     policy = FishPolicy(**policy_config).to(device)
     print(f"Policy parameters: {sum(p.numel() for p in policy.parameters()):,}")
@@ -107,18 +124,24 @@ def train(config: dict, args: argparse.Namespace):
     max_grad_norm = ppo_config.get("max_grad_norm", 0.5)
     anneal_lr = config["training"].get("anneal_lr", True)
 
-    # Batch sizes
+    # Batch sizes (per env, includes all fish)
     batch_size = num_envs * num_steps
     minibatch_size = batch_size // num_minibatches
+
+    # For policy updates, we process each fish independently
+    # So effective batch size is batch_size * num_fish
+    fish_batch_size = batch_size * num_fish
+    fish_minibatch_size = minibatch_size * num_fish
 
     # Calculate number of updates
     num_updates = total_timesteps // batch_size
     print(f"Total updates: {num_updates}")
-    print(f"Batch size: {batch_size}, Minibatch size: {minibatch_size}")
+    print(f"Batch size: {batch_size}, Fish batch size: {fish_batch_size}")
+    print(f"Minibatch size: {minibatch_size}, Fish minibatch size: {fish_minibatch_size}")
 
-    # Storage for rollout
-    obs_buffer = np.zeros((num_steps, num_envs, env.OBS_DIM), dtype=np.float32)
-    actions_buffer = np.zeros((num_steps, num_envs, 2), dtype=np.float32)
+    # Storage for rollout (stores flattened multi-fish data per env)
+    obs_buffer = np.zeros((num_steps, num_envs, total_obs_dim), dtype=np.float32)
+    actions_buffer = np.zeros((num_steps, num_envs, total_action_dim), dtype=np.float32)
     rewards_buffer = np.zeros((num_steps, num_envs), dtype=np.float32)
     dones_buffer = np.zeros((num_steps, num_envs), dtype=np.float32)
     values_buffer = np.zeros((num_steps, num_envs), dtype=np.float32)
@@ -151,20 +174,34 @@ def train(config: dict, args: argparse.Namespace):
             global_step += num_envs
 
             obs_buffer[step] = obs
-            obs_tensor = torch.from_numpy(obs).to(device)
+
+            # Reshape obs for policy: (num_envs, num_fish * obs_dim) -> (num_envs * num_fish, obs_dim)
+            obs_reshaped = obs.reshape(num_envs * num_fish, single_obs_dim)
+            obs_tensor = torch.from_numpy(obs_reshaped).to(device)
 
             with torch.no_grad():
                 action, log_prob, _, value = policy.get_action(obs_tensor)
+                # action: (num_envs * num_fish, 3)
+                # log_prob: (num_envs * num_fish,)
+                # value: (num_envs * num_fish, 1)
+
                 action = action.cpu().numpy()
                 log_prob = log_prob.cpu().numpy()
                 value = value.cpu().numpy().squeeze(-1)
 
-            actions_buffer[step] = action
-            log_probs_buffer[step] = log_prob
-            values_buffer[step] = value
+            # Reshape action back: (num_envs * num_fish, 3) -> (num_envs, num_fish * 3)
+            action_for_env = action.reshape(num_envs, total_action_dim)
+
+            # Aggregate log_prob and value across fish (sum log_probs, mean values)
+            log_prob_per_env = log_prob.reshape(num_envs, num_fish).sum(axis=1)
+            value_per_env = value.reshape(num_envs, num_fish).mean(axis=1)
+
+            actions_buffer[step] = action_for_env
+            log_probs_buffer[step] = log_prob_per_env
+            values_buffer[step] = value_per_env
 
             # Step environment
-            obs, reward, terminated, truncated, info = env.step(action)
+            obs, reward, terminated, truncated, info = env.step(action_for_env)
             done = terminated | truncated
 
             rewards_buffer[step] = reward
@@ -176,27 +213,42 @@ def train(config: dict, args: argparse.Namespace):
 
         # Compute GAE
         with torch.no_grad():
-            next_value = (
-                policy.get_value(torch.from_numpy(obs).to(device)).cpu().numpy().squeeze(-1)
-            )
+            obs_reshaped = obs.reshape(num_envs * num_fish, single_obs_dim)
+            next_value = policy.get_value(torch.from_numpy(obs_reshaped).to(device))
+            next_value = next_value.cpu().numpy().squeeze(-1)
+            # Aggregate across fish
+            next_value = next_value.reshape(num_envs, num_fish).mean(axis=1)
 
         advantages, returns = compute_gae(
             rewards_buffer, values_buffer, dones_buffer, next_value, gamma, gae_lambda
         )
 
-        # Flatten batches
-        b_obs = obs_buffer.reshape(-1, env.OBS_DIM)
-        b_actions = actions_buffer.reshape(-1, 2)
-        b_log_probs = log_probs_buffer.reshape(-1)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values_buffer.reshape(-1)
+        # For PPO update, we need per-fish data
+        # Reshape obs: (num_steps, num_envs, num_fish * obs_dim) -> (num_steps * num_envs * num_fish, obs_dim)
+        b_obs = obs_buffer.reshape(num_steps, num_envs, num_fish, single_obs_dim)
+        b_obs = b_obs.reshape(-1, single_obs_dim)
+
+        # Reshape actions: (num_steps, num_envs, num_fish * 3) -> (num_steps * num_envs * num_fish, 3)
+        b_actions = actions_buffer.reshape(num_steps, num_envs, num_fish, single_action_dim)
+        b_actions = b_actions.reshape(-1, single_action_dim)
+
+        # For advantages/returns/log_probs/values, replicate for each fish
+        # (num_steps, num_envs) -> (num_steps, num_envs, num_fish) -> (num_steps * num_envs * num_fish,)
+        b_log_probs_per_env = log_probs_buffer.reshape(-1)  # (num_steps * num_envs,)
+        b_advantages = advantages.reshape(-1)  # (num_steps * num_envs,)
+        b_returns = returns.reshape(-1)  # (num_steps * num_envs,)
+        b_values = values_buffer.reshape(-1)  # (num_steps * num_envs,)
+
+        # Replicate per-env values for each fish
+        b_advantages = np.repeat(b_advantages, num_fish)  # (num_steps * num_envs * num_fish,)
+        b_returns = np.repeat(b_returns, num_fish)
+        b_log_probs = np.repeat(b_log_probs_per_env / num_fish, num_fish)  # Distribute log_prob
 
         # Normalize advantages
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
-        # PPO update
-        b_inds = np.arange(batch_size)
+        # PPO update (over fish-level batches)
+        b_inds = np.arange(fish_batch_size)
         clip_fracs = []
         pg_losses = []
         vf_losses = []
@@ -205,8 +257,8 @@ def train(config: dict, args: argparse.Namespace):
         for _ in range(update_epochs):
             np.random.shuffle(b_inds)
 
-            for start in range(0, batch_size, minibatch_size):
-                end = start + minibatch_size
+            for start in range(0, fish_batch_size, fish_minibatch_size):
+                end = start + fish_minibatch_size
                 mb_inds = b_inds[start:end]
 
                 mb_obs = torch.from_numpy(b_obs[mb_inds]).to(device)

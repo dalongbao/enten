@@ -1,19 +1,27 @@
 """
-Single fish Gymnasium environment for RL training.
+Multi-fish Gymnasium environment for RL training.
 
-Physics matches src/fish.h exactly:
-- mass = 1.0
-- drag_coeff = 2.0
-- max_thrust = 500.0
-- turn_rate = 3.0
-- eat_radius = 25.0
+Supports N fish (default 3) swimming in the same environment with:
+- Independent physics and control per fish
+- Shared food system (fish compete for food)
+- Social dynamics (schooling rewards based on proximity)
+- Observation includes other fish positions
 
-Perception:
+NEW HYBRID PHYSICS - Model controls high-level movement:
+- speed [0, 1]: Desired forward speed
+- direction [-1, 1]: Turn rate (-1=left, +1=right)
+- urgency [0, 1]: Movement intensity (affects tail frequency)
+
+Fin animation is computed automatically from movement.
+Thrust scales with fin area (different goldfish varieties swim differently).
+
+Perception (per fish):
 - 16 raycasts in 180° frontal arc → 32 features
 - 8 lateral line sensors (4 per side) → 16 features
-- 3 proprioceptive features (forward vel, lateral vel, angular vel)
-- 1 hunger feature
-- Total: 52 features
+- 4 proprioceptive features (forward vel, lateral vel, angular vel, speed)
+- 4 internal state features (hunger, stress, social_comfort, energy)
+- 4 social features (nearest_dist, nearest_angle, num_nearby, heading_diff)
+- Total: 60 features per fish
 """
 
 import numpy as np
@@ -22,7 +30,7 @@ from gymnasium import spaces
 
 
 class FishEnv(gym.Env):
-    """Single fish environment with raycast + lateral line perception."""
+    """Multi-fish environment with hybrid control and equilibrium system."""
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 60}
 
@@ -32,50 +40,61 @@ class FishEnv(gym.Env):
     MAX_RAY_LENGTH = 200.0
     NUM_LATERAL_SENSORS = 8
 
-    # Observation: raycasts (32) + lateral (16) + proprio (3) + hunger (1) = 52
-    OBS_DIM = NUM_RAYS * 2 + NUM_LATERAL_SENSORS * 2 + 3 + 1
+    # Observation: raycasts (32) + lateral (16) + proprio (4) + internal (4) + social (4) = 60
+    OBS_DIM = NUM_RAYS * 2 + NUM_LATERAL_SENSORS * 2 + 4 + 4 + 4
+
+    # Tail frequency range (very slow for goldfish: 0.3-0.5 Hz)
+    TAIL_FREQ_MIN = 0.3
+    TAIL_FREQ_MAX = 0.5
 
     def __init__(self, config=None, render_mode=None):
         super().__init__()
         self.config = config or {}
         self.render_mode = render_mode
 
+        # Number of fish
+        self.num_fish = self.config.get("num_fish", 3)
+
         # Environment dimensions
         self.width = self.config.get("width", 800)
         self.height = self.config.get("height", 600)
 
-        # Observation and action spaces
+        # Observation and action spaces (per-fish, will be flattened)
+        # Flattened spaces for compatibility with standard RL algorithms
         self.observation_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(self.OBS_DIM,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(self.num_fish * self.OBS_DIM,), dtype=np.float32
         )
+        # 3 outputs per fish - speed, direction, urgency
         self.action_space = spaces.Box(
-            low=np.array([0.0, -1.0], dtype=np.float32),  # thrust, turn
-            high=np.array([1.0, 1.0], dtype=np.float32),
+            low=np.tile([0.0, -1.0, 0.0], self.num_fish).astype(np.float32),
+            high=np.tile([1.0, 1.0, 1.0], self.num_fish).astype(np.float32),
             dtype=np.float32,
         )
 
-        # Physics parameters (must match src/fish.h)
-        self.mass = 1.0
-        self.drag_coeff = 2.0
-        self.max_thrust = 500.0
-        self.turn_rate = 3.0
-        self.dt = 1.0 / 60.0  # 60 FPS
+        # Per-fish observation/action spaces (for reference)
+        self.single_obs_dim = self.OBS_DIM
+        self.single_action_dim = 3
+
+        # Goldfish variety (can be configured)
+        variety = self.config.get("variety", "common")
+        self._set_variety(variety)
 
         # Food parameters
         self.max_food = 32
-        self.eat_radius = 25.0
-        self.food_aoe_base = 30.0  # Base AOE radius
-        self.food_aoe_growth = 5.0  # AOE growth per second
+        self.eat_radius = 40.0
+        self.food_aoe_base = 30.0
+        self.food_aoe_growth = 5.0
 
         # Episode settings
         self.max_steps = self.config.get("max_steps", 1000)
+        self.dt = 1.0 / 60.0
 
-        # Hunger parameters
-        hunger_config = self.config.get("hunger", {})
-        self.hunger_initial = hunger_config.get("initial", 1.0)
-        self.hunger_decay_rate = hunger_config.get("decay_rate", 0.001)
-        self.hunger_eat_restore = hunger_config.get("eat_restore", 0.3)
-        self.hunger_penalty_scale = hunger_config.get("penalty_scale", 0.01)
+        # Internal state parameters
+        self.energy_cost_base = 0.0001
+        self.energy_recovery_rate = 0.0005
+        self.hunger_decay_rate = 0.001
+        self.hunger_eat_restore = 0.3
+        self.stress_decay_rate = 0.1
 
         # Exploration parameters
         exploration_config = self.config.get("exploration", {})
@@ -83,32 +102,95 @@ class FishEnv(gym.Env):
         self.visit_bonus = exploration_config.get("visit_bonus", 0.05)
         self.distance_bonus = exploration_config.get("distance_bonus", 0.001)
 
-        # State (initialized in reset)
-        self.pos = None
-        self.vel = None
-        self.angle = None
-        self.angular_vel = None
-        self.food = None  # (max_food, 3): x, y, age
+        # Social/schooling parameters
+        self.schooling_min_dist = 50.0   # Minimum comfortable distance
+        self.schooling_max_dist = 150.0  # Maximum comfortable distance
+        self.collision_dist = 30.0       # Too close - penalty
+        self.cohesion_reward = 0.01      # Reward for being in comfort zone
+        self.separation_penalty = 0.05   # Penalty for collision
+        self.alignment_reward = 0.005    # Reward for similar heading
+
+        # State arrays (initialized in reset) - now per fish
+        self.pos = None          # (num_fish, 2)
+        self.vel = None          # (num_fish, 2)
+        self.angle = None        # (num_fish,)
+        self.angular_vel = None  # (num_fish,)
+        self.current_speed = None  # (num_fish,)
+        self.tail_phase = None   # (num_fish,)
+        self.body_curve = None   # (num_fish,)
+        self.left_pectoral = None   # (num_fish,)
+        self.right_pectoral = None  # (num_fish,)
+        self.food = None
         self.food_count = 0
         self.steps = 0
 
-        # Hunger state
-        self.hunger = None
+        # Internal state per fish
+        self.hunger = None       # (num_fish,)
+        self.stress = None       # (num_fish,)
+        self.social_comfort = None  # (num_fish,)
+        self.energy = None       # (num_fish,)
 
-        # Exploration state
-        self.visited_cells = None
-        self.prev_pos = None
+        # Exploration state per fish
+        self.visited_cells = None  # list of sets, one per fish
+        self.prev_pos = None     # (num_fish, 2)
+
+    def _set_variety(self, variety: str):
+        """Set physics parameters based on goldfish variety."""
+        if variety == "comet":
+            # Small fins, fast & agile
+            self.body_length = 80.0
+            self.fin_area_mult = 0.7
+            self.thrust_coeff = 150.0
+            self.drag_coeff = 3.0
+            self.turn_rate = 2.0
+            self.mass = 0.8
+        elif variety == "fancy":
+            # Large flowing fins, slow & graceful
+            self.body_length = 80.0
+            self.fin_area_mult = 1.5
+            self.thrust_coeff = 80.0
+            self.drag_coeff = 6.0
+            self.turn_rate = 1.0
+            self.mass = 1.2
+        else:  # common (default)
+            # Balanced
+            self.body_length = 80.0
+            self.fin_area_mult = 1.0
+            self.thrust_coeff = 120.0
+            self.drag_coeff = 4.0
+            self.turn_rate = 1.5
+            self.mass = 1.0
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
 
-        # Initialize fish at center with random angle
-        self.pos = np.array(
-            [self.width / 2.0, self.height / 2.0], dtype=np.float32
-        )
-        self.vel = np.zeros(2, dtype=np.float32)
-        self.angle = self.np_random.uniform(0, 2 * np.pi)
-        self.angular_vel = 0.0
+        n = self.num_fish
+
+        # Initialize fish at random positions with random angles
+        # Ensure fish don't spawn too close to each other
+        self.pos = np.zeros((n, 2), dtype=np.float32)
+        for i in range(n):
+            while True:
+                pos = self.np_random.uniform(
+                    [self.body_length, self.body_length],
+                    [self.width - self.body_length, self.height - self.body_length]
+                )
+                # Check distance to all previously placed fish
+                if i == 0:
+                    break
+                dists = np.linalg.norm(self.pos[:i] - pos, axis=1)
+                if dists.min() > self.body_length * 2:
+                    break
+            self.pos[i] = pos
+
+        self.vel = np.zeros((n, 2), dtype=np.float32)
+        self.angle = self.np_random.uniform(0, 2 * np.pi, size=n).astype(np.float32)
+        self.angular_vel = np.zeros(n, dtype=np.float32)
+        self.current_speed = np.zeros(n, dtype=np.float32)
+        self.tail_phase = np.zeros(n, dtype=np.float32)
+        self.body_curve = np.zeros(n, dtype=np.float32)
+        self.left_pectoral = np.zeros(n, dtype=np.float32)
+        self.right_pectoral = np.zeros(n, dtype=np.float32)
 
         # Initialize food array
         self.food = np.zeros((self.max_food, 3), dtype=np.float32)
@@ -120,37 +202,48 @@ class FishEnv(gym.Env):
 
         self.steps = 0
 
-        # Initialize hunger
-        self.hunger = self.hunger_initial
+        # Initialize internal state per fish
+        self.hunger = np.ones(n, dtype=np.float32) * 0.6  # Start slightly hungry
+        self.stress = np.zeros(n, dtype=np.float32)  # Start calm
+        self.social_comfort = np.ones(n, dtype=np.float32) * 0.5  # Neutral
+        self.energy = np.ones(n, dtype=np.float32)  # Start rested
 
-        # Initialize exploration tracking
-        self.visited_cells = set()
+        # Initialize exploration tracking per fish
+        self.visited_cells = [set() for _ in range(n)]
         self.prev_pos = self.pos.copy()
 
         return self._get_obs(), {}
 
     def step(self, action):
-        thrust = float(np.clip(action[0], 0.0, 1.0))
-        turn = float(np.clip(action[1], -1.0, 1.0))
+        action = np.asarray(action, dtype=np.float32)
+        # Reshape flattened action to (num_fish, 3)
+        actions = action.reshape(self.num_fish, 3)
 
-        # Physics update (matches fish.h exactly)
-        self._physics_step(thrust, turn)
+        # Physics update for each fish
+        for i in range(self.num_fish):
+            speed = float(np.clip(actions[i, 0], 0.0, 1.0))
+            direction = float(np.clip(actions[i, 1], -1.0, 1.0))
+            urgency = float(np.clip(actions[i, 2], 0.0, 1.0))
+            self._physics_step_single(i, speed, direction, urgency)
 
         # Age food (increases AOE)
         if self.food_count > 0:
             self.food[: self.food_count, 2] += self.dt
 
-        # Check for food eating (also restores hunger)
-        reward = self._check_eating()
+        # Check for food eating (all fish compete)
+        food_eaten = self._check_eating()  # Returns array of per-fish counts
 
-        # Add exploration reward
-        reward += self._compute_exploration_reward()
+        # Compute equilibrium reward per fish
+        rewards = self._compute_equilibrium_reward(food_eaten)
 
-        # Apply hunger decay and penalty
-        self.hunger -= self.hunger_decay_rate
-        self.hunger = max(0.0, self.hunger)
-        hunger_penalty = self.hunger_penalty_scale * (1.0 - min(1.0, self.hunger))
-        reward -= hunger_penalty
+        # Add social/schooling reward
+        rewards += self._compute_social_reward()
+
+        # Add exploration reward per fish
+        rewards += self._compute_exploration_reward()
+
+        # Aggregate reward (sum across fish for environment-level reward)
+        total_reward = float(rewards.sum())
 
         # Spawn new food occasionally
         spawn_rate = self.config.get("food_spawn_rate", 0.02)
@@ -161,192 +254,153 @@ class FishEnv(gym.Env):
         truncated = self.steps >= self.max_steps
         terminated = False
 
-        return self._get_obs(), reward, terminated, truncated, {}
+        return self._get_obs(), total_reward, terminated, truncated, {}
 
-    def _physics_step(self, thrust: float, turn: float):
-        """Physics update matching src/fish.h exactly."""
-        # Angular update
-        self.angular_vel = turn * self.turn_rate
-        self.angle += self.angular_vel * self.dt
+    def _physics_step_single(self, fish_idx: int, speed: float, direction: float, urgency: float):
+        """Hybrid physics for a single fish: model controls speed/direction/urgency, fins auto-animate."""
+        i = fish_idx
 
-        # Thrust force in heading direction
-        thrust_force = thrust * self.max_thrust
-        fx = thrust_force * np.cos(self.angle)
-        fy = thrust_force * np.sin(self.angle)
+        # === TAIL ANIMATION (auto-computed from speed & urgency) ===
+        tail_freq = self.TAIL_FREQ_MIN + urgency * (self.TAIL_FREQ_MAX - self.TAIL_FREQ_MIN)
+        self.tail_phase[i] += tail_freq * 2.0 * np.pi * self.dt
+        if self.tail_phase[i] > 2.0 * np.pi:
+            self.tail_phase[i] -= 2.0 * np.pi
 
-        # Drag force opposing velocity
-        speed = np.linalg.norm(self.vel)
-        if speed > 0.0001:
-            drag = self.drag_coeff * speed
-            fx -= drag * (self.vel[0] / speed)
-            fy -= drag * (self.vel[1] / speed)
+        # === BODY CURVE (auto-computed from direction) ===
+        target_curve = direction * 0.4
+        self.body_curve[i] += (target_curve - self.body_curve[i]) * 5.0 * self.dt
 
-        # Integration (F = ma, a = F/m)
+        # === PECTORAL FINS (auto-computed from direction & speed) ===
+        base_pec = 0.3 - speed * 0.2
+        self.left_pectoral[i] = base_pec + direction * 0.3
+        self.right_pectoral[i] = base_pec - direction * 0.3
+
+        # === ROTATION ===
+        effective_turn_rate = self.turn_rate * (0.5 + urgency * 0.5)
+        self.angular_vel[i] = direction * effective_turn_rate
+        self.angle[i] += self.angular_vel[i] * self.dt
+
+        # === THRUST ===
+        # Pulsed based on tail phase
+        tail_pulse = np.sin(self.tail_phase[i]) ** 2
+
+        # Effective thrust: base + urgency boost, modulated by tail pulse
+        thrust_factor = 0.3 + urgency * 0.7
+        thrust = speed * self.thrust_coeff * self.fin_area_mult * thrust_factor
+        thrust *= (0.5 + tail_pulse * 0.5)
+
+        # Thrust direction (slightly affected by body curve)
+        thrust_angle = self.angle[i] - self.body_curve[i] * 0.2
+        fx = thrust * np.cos(thrust_angle)
+        fy = thrust * np.sin(thrust_angle)
+
+        # === DRAG ===
+        self.current_speed[i] = np.linalg.norm(self.vel[i])
+        effective_drag = self.drag_coeff * self.fin_area_mult
+        effective_drag += abs(self.body_curve[i]) * 2.0
+
+        if self.current_speed[i] > 0.0001:
+            drag_force = effective_drag * self.current_speed[i]
+            fx -= drag_force * (self.vel[i, 0] / self.current_speed[i])
+            fy -= drag_force * (self.vel[i, 1] / self.current_speed[i])
+
+        # === INTEGRATION ===
         ax = fx / self.mass
         ay = fy / self.mass
-        self.vel[0] += ax * self.dt
-        self.vel[1] += ay * self.dt
-        self.pos[0] += self.vel[0] * self.dt
-        self.pos[1] += self.vel[1] * self.dt
+        self.vel[i, 0] += ax * self.dt
+        self.vel[i, 1] += ay * self.dt
+        self.pos[i, 0] += self.vel[i, 0] * self.dt
+        self.pos[i, 1] += self.vel[i, 1] * self.dt
 
-        # Wraparound boundaries
-        if self.pos[0] < 0:
-            self.pos[0] += self.width
-        if self.pos[0] >= self.width:
-            self.pos[0] -= self.width
-        if self.pos[1] < 0:
-            self.pos[1] += self.height
-        if self.pos[1] >= self.height:
-            self.pos[1] -= self.height
+        # === INTERNAL STATE UPDATES ===
+        # Energy: depleted by movement, recovered by resting
+        movement_intensity = speed * (0.3 + urgency * 0.7)
+        self.energy[i] -= self.energy_cost_base * movement_intensity
+        self.energy[i] += self.energy_recovery_rate * (1.0 - speed) * self.dt
+        self.energy[i] = np.clip(self.energy[i], 0.0, 1.0)
+
+        # Hunger: slowly decays
+        self.hunger[i] -= self.hunger_decay_rate * self.dt
+        self.hunger[i] = max(0.0, self.hunger[i])
+
+        # Stress: slowly decays when calm
+        self.stress[i] *= (1.0 - self.stress_decay_rate * self.dt)
+
+        # === WRAP AROUND ===
+        if self.pos[i, 0] < 0:
+            self.pos[i, 0] += self.width
+        if self.pos[i, 0] >= self.width:
+            self.pos[i, 0] -= self.width
+        if self.pos[i, 1] < 0:
+            self.pos[i, 1] += self.height
+        if self.pos[i, 1] >= self.height:
+            self.pos[i, 1] -= self.height
 
     def _get_obs(self):
-        """Construct observation vector: raycasts + lateral line + proprioception."""
-        obs = np.zeros(self.OBS_DIM, dtype=np.float32)
+        """Construct observation vector for all fish (flattened)."""
+        obs = np.zeros((self.num_fish, self.OBS_DIM), dtype=np.float32)
 
-        # Raycasts (32 features)
-        ray_obs = self._cast_rays()
-        obs[: self.NUM_RAYS * 2] = ray_obs
+        for i in range(self.num_fish):
+            # Raycasts (32 features)
+            ray_obs = self._cast_rays_single(i)
+            obs[i, : self.NUM_RAYS * 2] = ray_obs
 
-        # Lateral line (16 features)
-        lateral_start = self.NUM_RAYS * 2
-        lateral_obs = self._sense_lateral_line()
-        obs[lateral_start : lateral_start + self.NUM_LATERAL_SENSORS * 2] = lateral_obs
+            # Lateral line (16 features)
+            lateral_start = self.NUM_RAYS * 2
+            lateral_obs = self._sense_lateral_line_single(i)
+            obs[i, lateral_start : lateral_start + self.NUM_LATERAL_SENSORS * 2] = lateral_obs
 
-        # Proprioception (3 features)
-        heading = np.array([np.cos(self.angle), np.sin(self.angle)])
-        perpendicular = np.array([-np.sin(self.angle), np.cos(self.angle)])
+            # Proprioception (4 features)
+            proprio_start = lateral_start + self.NUM_LATERAL_SENSORS * 2
+            heading = np.array([np.cos(self.angle[i]), np.sin(self.angle[i])])
+            perpendicular = np.array([-np.sin(self.angle[i]), np.cos(self.angle[i])])
 
-        # Velocity in fish-relative coordinates, normalized
-        vel_forward = np.dot(self.vel, heading) / 100.0
-        vel_lateral = np.dot(self.vel, perpendicular) / 100.0
-        angular_vel_norm = self.angular_vel / self.turn_rate
+            vel_forward = np.dot(self.vel[i], heading) / 100.0
+            vel_lateral = np.dot(self.vel[i], perpendicular) / 100.0
+            angular_vel_norm = self.angular_vel[i] / self.turn_rate
+            speed_norm = self.current_speed[i] / 100.0
 
-        obs[-4] = np.clip(vel_forward, -1, 1)
-        obs[-3] = np.clip(vel_lateral, -1, 1)
-        obs[-2] = np.clip(angular_vel_norm, -1, 1)
+            obs[i, proprio_start] = np.clip(vel_forward, -1, 1)
+            obs[i, proprio_start + 1] = np.clip(vel_lateral, -1, 1)
+            obs[i, proprio_start + 2] = np.clip(angular_vel_norm, -1, 1)
+            obs[i, proprio_start + 3] = np.clip(speed_norm, -1, 1)
 
-        # Hunger (1 feature)
-        obs[-1] = np.clip(self.hunger, 0.0, 1.0)
+            # Internal state (4 features)
+            internal_start = proprio_start + 4
+            obs[i, internal_start] = self.hunger[i]
+            obs[i, internal_start + 1] = self.stress[i]
+            obs[i, internal_start + 2] = self.social_comfort[i]
+            obs[i, internal_start + 3] = self.energy[i]
 
-        return obs
+            # Social features (4 features): nearest_dist, nearest_angle, num_nearby, heading_diff
+            social_start = internal_start + 4
+            social_obs = self._compute_other_fish_obs(i)
+            obs[i, social_start : social_start + 4] = social_obs
 
-    def _cast_rays(self):
-        """Cast rays in frontal arc, detect food AOE intersections."""
-        rays = np.zeros(self.NUM_RAYS * 2, dtype=np.float32)
+        # Return flattened observation
+        return obs.flatten()
 
-        for i in range(self.NUM_RAYS):
-            # Ray angle: spread across RAY_ARC centered on heading
-            t = i / (self.NUM_RAYS - 1) if self.NUM_RAYS > 1 else 0.5
-            ray_angle = self.angle + (t - 0.5) * self.RAY_ARC
-            ray_dir = np.array([np.cos(ray_angle), np.sin(ray_angle)])
+    def _compute_other_fish_obs(self, fish_idx: int) -> np.ndarray:
+        """Compute social observation features for one fish."""
+        i = fish_idx
+        n = self.num_fish
 
-            min_dist = self.MAX_RAY_LENGTH
-            max_intensity = 0.0
+        if n == 1:
+            # Single fish: no social features
+            return np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
-            for j in range(self.food_count):
-                food_pos = self.food[j, :2]
-                food_age = self.food[j, 2]
-                food_aoe = self.food_aoe_base + food_age * self.food_aoe_growth
+        # Compute distances to all other fish
+        other_indices = [j for j in range(n) if j != i]
+        dists = []
+        angles_to_others = []
 
-                # Vector from fish to food
-                to_food = food_pos - self.pos
+        my_pos = self.pos[i]
+        my_angle = self.angle[i]
+        my_heading = np.array([np.cos(my_angle), np.sin(my_angle)])
 
-                # Handle wraparound: check if food is closer via wrap
-                for dx in [-self.width, 0, self.width]:
-                    for dy in [-self.height, 0, self.height]:
-                        wrapped_to_food = to_food + np.array([dx, dy])
-
-                        # Project food onto ray direction
-                        proj = np.dot(wrapped_to_food, ray_dir)
-
-                        if proj > 0 and proj < self.MAX_RAY_LENGTH:
-                            # Closest point on ray to food center
-                            closest = ray_dir * proj
-                            dist_to_center = np.linalg.norm(wrapped_to_food - closest)
-
-                            # Check if ray passes through AOE
-                            if dist_to_center < food_aoe:
-                                if proj < min_dist:
-                                    min_dist = proj
-                                    # Intensity: how deep into AOE (0 at edge, 1 at center)
-                                    max_intensity = 1.0 - (dist_to_center / food_aoe)
-
-            rays[i * 2] = min_dist / self.MAX_RAY_LENGTH  # Normalized distance
-            rays[i * 2 + 1] = max_intensity  # Food intensity
-
-        return rays
-
-    def _sense_lateral_line(self):
-        """Sense pressure gradients from nearby food using lateral line."""
-        lateral = np.zeros(self.NUM_LATERAL_SENSORS * 2, dtype=np.float32)
-
-        # Fish coordinate system
-        heading = np.array([np.cos(self.angle), np.sin(self.angle)])
-        perpendicular = np.array([-np.sin(self.angle), np.cos(self.angle)])
-
-        # Sensor positions: 4 on each side, spread along body
-        # Layout: sensors 0-3 on left side, 4-7 on right side
-        fish_length = 30.0  # Visual length of fish
-
-        for i in range(self.NUM_LATERAL_SENSORS):
-            # Side: left (-1) for first 4, right (+1) for last 4
-            side = -1 if i < 4 else 1
-            # Position along body: spread from -0.4 to +0.4 of length
-            along = (i % 4 - 1.5) / 3.0 * 0.8 * fish_length
-
-            sensor_pos = (
-                self.pos + heading * along + perpendicular * side * (fish_length / 4)
-            )
-
-            # Accumulate pressure gradient from nearby food
-            pressure = np.zeros(2, dtype=np.float32)
-
-            for j in range(self.food_count):
-                food_pos = self.food[j, :2]
-                food_age = self.food[j, 2]
-                food_aoe = self.food_aoe_base + food_age * self.food_aoe_growth
-
-                # Vector from sensor to food (with wraparound)
-                to_food = food_pos - sensor_pos
-
-                # Handle wraparound
-                if to_food[0] > self.width / 2:
-                    to_food[0] -= self.width
-                elif to_food[0] < -self.width / 2:
-                    to_food[0] += self.width
-                if to_food[1] > self.height / 2:
-                    to_food[1] -= self.height
-                elif to_food[1] < -self.height / 2:
-                    to_food[1] += self.height
-
-                dist = np.linalg.norm(to_food)
-
-                # Lateral line detects within 2x AOE range
-                sensing_range = food_aoe * 2
-                if dist < sensing_range and dist > 0.1:
-                    # Pressure gradient points toward food
-                    # Intensity falls off with distance
-                    intensity = (sensing_range - dist) / sensing_range
-                    pressure += (to_food / dist) * intensity
-
-            # Transform pressure to fish-local coordinates
-            pressure_local_x = np.dot(pressure, heading)
-            pressure_local_y = np.dot(pressure, perpendicular)
-
-            lateral[i * 2] = np.clip(pressure_local_x / 2.0, -1, 1)
-            lateral[i * 2 + 1] = np.clip(pressure_local_y / 2.0, -1, 1)
-
-        return lateral
-
-    def _check_eating(self):
-        """Check if fish eats any food. Returns reward."""
-        reward = 0.0
-        i = 0
-        while i < self.food_count:
-            food_pos = self.food[i, :2]
-
-            # Distance with wraparound
-            diff = self.pos - food_pos
+        for j in other_indices:
+            diff = self.pos[j] - my_pos
+            # Handle wraparound
             if diff[0] > self.width / 2:
                 diff[0] -= self.width
             elif diff[0] < -self.width / 2:
@@ -357,50 +411,303 @@ class FishEnv(gym.Env):
                 diff[1] += self.height
 
             dist = np.linalg.norm(diff)
+            dists.append(dist)
 
-            if dist < self.eat_radius:
-                reward += 1.0
-                # Restore hunger (no cap - overeating allowed like real goldfish)
-                self.hunger += self.hunger_eat_restore
-                # Remove food by swapping with last
-                self.food[i] = self.food[self.food_count - 1]
-                self.food_count -= 1
+            # Angle to other fish (relative to my heading)
+            if dist > 0.1:
+                angle_to_other = np.arctan2(diff[1], diff[0]) - my_angle
+                # Normalize to [-pi, pi]
+                while angle_to_other > np.pi:
+                    angle_to_other -= 2 * np.pi
+                while angle_to_other < -np.pi:
+                    angle_to_other += 2 * np.pi
             else:
+                angle_to_other = 0.0
+            angles_to_others.append(angle_to_other)
+
+        dists = np.array(dists)
+        angles_to_others = np.array(angles_to_others)
+
+        # Feature 1: Normalized distance to nearest fish
+        nearest_idx = np.argmin(dists)
+        nearest_dist = dists[nearest_idx]
+        nearest_dist_norm = np.clip(nearest_dist / self.schooling_max_dist, 0.0, 1.0)
+
+        # Feature 2: Angle to nearest fish (normalized to [-1, 1])
+        nearest_angle_norm = angles_to_others[nearest_idx] / np.pi
+
+        # Feature 3: Number of fish nearby (within schooling distance), normalized
+        num_nearby = np.sum(dists < self.schooling_max_dist)
+        num_nearby_norm = num_nearby / (n - 1)
+
+        # Feature 4: Average heading difference to nearby fish
+        heading_diffs = []
+        for j_idx, j in enumerate(other_indices):
+            if dists[j_idx] < self.schooling_max_dist:
+                other_heading = np.array([np.cos(self.angle[j]), np.sin(self.angle[j])])
+                # Dot product gives cos of angle between headings
+                heading_diff = np.dot(my_heading, other_heading)
+                heading_diffs.append(heading_diff)
+
+        if heading_diffs:
+            avg_heading_diff = np.mean(heading_diffs)
+        else:
+            avg_heading_diff = 0.0
+
+        return np.array([
+            nearest_dist_norm,
+            nearest_angle_norm,
+            num_nearby_norm,
+            avg_heading_diff  # Already in [-1, 1] from dot product
+        ], dtype=np.float32)
+
+    def _compute_social_reward(self) -> np.ndarray:
+        """Compute schooling/social rewards for all fish with dynamic comfort zones."""
+        rewards = np.zeros(self.num_fish, dtype=np.float32)
+
+        if self.num_fish == 1:
+            return rewards
+
+        for i in range(self.num_fish):
+            # Dynamic comfort zones based on stress level
+            # Stressed = tight school (30-100px), Calm = loose school (50-200px)
+            stress = self.stress[i]
+            min_dist = 30 + (1 - stress) * 20   # 30-50px
+            max_dist = 100 + (1 - stress) * 100  # 100-200px
+
+            # Compute distance to all other fish
+            dists = []
+            for j in range(self.num_fish):
+                if j == i:
+                    continue
+                diff = self.pos[j] - self.pos[i]
+                # Handle wraparound
+                if diff[0] > self.width / 2:
+                    diff[0] -= self.width
+                elif diff[0] < -self.width / 2:
+                    diff[0] += self.width
+                if diff[1] > self.height / 2:
+                    diff[1] -= self.height
+                elif diff[1] < -self.height / 2:
+                    diff[1] += self.height
+                dists.append(np.linalg.norm(diff))
+
+            nearest_dist = min(dists)
+
+            # Separation: strong penalty for collision
+            if nearest_dist < self.collision_dist:
+                rewards[i] -= self.separation_penalty
+            elif nearest_dist < min_dist:
+                # Graduated penalty for being too close
+                rewards[i] -= 0.02 * (min_dist - nearest_dist) / min_dist
+
+            # Cohesion: reward for being in comfort zone (peak at center)
+            elif min_dist <= nearest_dist <= max_dist:
+                zone_center = (min_dist + max_dist) / 2
+                distance_from_center = abs(nearest_dist - zone_center)
+                zone_half_width = (max_dist - min_dist) / 2
+                rewards[i] += self.cohesion_reward * (1 - distance_from_center / zone_half_width)
+
+            # Alignment: reward for similar heading to nearest fish
+            nearest_idx = dists.index(nearest_dist)
+            other_indices = [j for j in range(self.num_fish) if j != i]
+            nearest_fish = other_indices[nearest_idx]
+            my_heading = np.array([np.cos(self.angle[i]), np.sin(self.angle[i])])
+            other_heading = np.array([np.cos(self.angle[nearest_fish]), np.sin(self.angle[nearest_fish])])
+            heading_dot = np.dot(my_heading, other_heading)
+            if heading_dot > 0.7:  # Within ~45 degrees
+                rewards[i] += self.alignment_reward * (heading_dot - 0.7) / 0.3
+
+            # Update social_comfort based on distances (using dynamic zones)
+            in_comfort_zone = sum(1 for d in dists if min_dist < d < max_dist)
+            too_close = sum(1 for d in dists if d < self.collision_dist)
+
+            if too_close > 0:
+                self.social_comfort[i] -= 0.05 * self.dt
+            elif in_comfort_zone > 0:
+                self.social_comfort[i] += 0.02 * self.dt
+            else:
+                self.social_comfort[i] -= 0.01 * self.dt
+
+            self.social_comfort[i] = np.clip(self.social_comfort[i], 0.0, 1.0)
+
+        return rewards
+
+    def _cast_rays_single(self, fish_idx: int) -> np.ndarray:
+        """Cast rays in frontal arc for a single fish, detect food AOE intersections."""
+        rays = np.zeros(self.NUM_RAYS * 2, dtype=np.float32)
+        pos = self.pos[fish_idx]
+        angle = self.angle[fish_idx]
+
+        for i in range(self.NUM_RAYS):
+            t = i / (self.NUM_RAYS - 1) if self.NUM_RAYS > 1 else 0.5
+            ray_angle = angle + (t - 0.5) * self.RAY_ARC
+            ray_dir = np.array([np.cos(ray_angle), np.sin(ray_angle)])
+
+            min_dist = self.MAX_RAY_LENGTH
+            max_intensity = 0.0
+
+            for j in range(self.food_count):
+                food_pos = self.food[j, :2]
+                food_age = self.food[j, 2]
+                food_aoe = self.food_aoe_base + food_age * self.food_aoe_growth
+
+                to_food = food_pos - pos
+
+                for dx in [-self.width, 0, self.width]:
+                    for dy in [-self.height, 0, self.height]:
+                        wrapped_to_food = to_food + np.array([dx, dy])
+                        proj = np.dot(wrapped_to_food, ray_dir)
+
+                        if proj > 0 and proj < self.MAX_RAY_LENGTH:
+                            closest = ray_dir * proj
+                            dist_to_center = np.linalg.norm(wrapped_to_food - closest)
+
+                            if dist_to_center < food_aoe:
+                                if proj < min_dist:
+                                    min_dist = proj
+                                    max_intensity = 1.0 - (dist_to_center / food_aoe)
+
+            rays[i * 2] = min_dist / self.MAX_RAY_LENGTH
+            rays[i * 2 + 1] = max_intensity
+
+        return rays
+
+    def _sense_lateral_line_single(self, fish_idx: int) -> np.ndarray:
+        """Sense pressure gradients from nearby food using lateral line for a single fish."""
+        lateral = np.zeros(self.NUM_LATERAL_SENSORS * 2, dtype=np.float32)
+        pos = self.pos[fish_idx]
+        angle = self.angle[fish_idx]
+
+        heading = np.array([np.cos(angle), np.sin(angle)])
+        perpendicular = np.array([-np.sin(angle), np.cos(angle)])
+
+        for i in range(self.NUM_LATERAL_SENSORS):
+            side = -1 if i < 4 else 1
+            along = (i % 4 - 1.5) / 3.0 * 0.8 * self.body_length
+
+            sensor_pos = pos + heading * along + perpendicular * side * (self.body_length / 4)
+
+            pressure = np.zeros(2, dtype=np.float32)
+
+            for j in range(self.food_count):
+                food_pos = self.food[j, :2]
+                food_age = self.food[j, 2]
+                food_aoe = self.food_aoe_base + food_age * self.food_aoe_growth
+
+                to_food = food_pos - sensor_pos
+
+                if to_food[0] > self.width / 2:
+                    to_food[0] -= self.width
+                elif to_food[0] < -self.width / 2:
+                    to_food[0] += self.width
+                if to_food[1] > self.height / 2:
+                    to_food[1] -= self.height
+                elif to_food[1] < -self.height / 2:
+                    to_food[1] += self.height
+
+                dist = np.linalg.norm(to_food)
+                sensing_range = food_aoe * 2
+
+                if dist < sensing_range and dist > 0.1:
+                    intensity = (sensing_range - dist) / sensing_range
+                    pressure += (to_food / dist) * intensity
+
+            pressure_local_x = np.dot(pressure, heading)
+            pressure_local_y = np.dot(pressure, perpendicular)
+
+            lateral[i * 2] = np.clip(pressure_local_x / 2.0, -1, 1)
+            lateral[i * 2 + 1] = np.clip(pressure_local_y / 2.0, -1, 1)
+
+        return lateral
+
+    def _check_eating(self) -> np.ndarray:
+        """Check if any fish eats food. Returns per-fish food counts eaten."""
+        eaten = np.zeros(self.num_fish, dtype=np.int32)
+
+        i = 0
+        while i < self.food_count:
+            food_pos = self.food[i, :2]
+            food_eaten = False
+
+            # Check all fish - first one to be close enough eats it
+            for fish_idx in range(self.num_fish):
+                diff = self.pos[fish_idx] - food_pos
+                if diff[0] > self.width / 2:
+                    diff[0] -= self.width
+                elif diff[0] < -self.width / 2:
+                    diff[0] += self.width
+                if diff[1] > self.height / 2:
+                    diff[1] -= self.height
+                elif diff[1] < -self.height / 2:
+                    diff[1] += self.height
+
+                dist = np.linalg.norm(diff)
+
+                if dist < self.eat_radius:
+                    eaten[fish_idx] += 1
+                    # Restore hunger for this fish
+                    self.hunger[fish_idx] = min(1.0, self.hunger[fish_idx] + self.hunger_eat_restore)
+                    # Remove food by swapping with last
+                    self.food[i] = self.food[self.food_count - 1]
+                    self.food_count -= 1
+                    food_eaten = True
+                    break  # Only one fish can eat each food item
+
+            if not food_eaten:
                 i += 1
 
-        return reward
+        return eaten
 
-    def _compute_exploration_reward(self):
-        """Compute exploration bonus for visiting new grid cells and moving."""
-        reward = 0.0
+    def _compute_equilibrium_reward(self, food_eaten: np.ndarray) -> np.ndarray:
+        """Compute reward based on maintaining internal equilibrium for each fish."""
+        rewards = np.zeros(self.num_fish, dtype=np.float32)
 
-        # Grid cell visit bonus
-        grid_x = int(self.pos[0] / self.grid_size)
-        grid_y = int(self.pos[1] / self.grid_size)
-        cell = (grid_x, grid_y)
+        # Food eating reward
+        rewards += food_eaten.astype(np.float32) * 1.0
 
-        if cell not in self.visited_cells:
-            self.visited_cells.add(cell)
-            reward += self.visit_bonus
+        # Target: all states near comfortable middle (0.5-0.7)
+        hunger_reward = -np.abs(self.hunger - 0.6) * 0.1
+        stress_reward = -self.stress * 0.2  # lower is better
+        social_reward = -np.abs(self.social_comfort - 0.6) * 0.1
+        energy_reward = -np.abs(self.energy - 0.5) * 0.05
 
-        # Distance traveled bonus (with wraparound handling)
-        diff = self.pos - self.prev_pos
+        rewards += hunger_reward + stress_reward + social_reward + energy_reward
 
-        # Handle wraparound
-        if diff[0] > self.width / 2:
-            diff[0] -= self.width
-        elif diff[0] < -self.width / 2:
-            diff[0] += self.width
-        if diff[1] > self.height / 2:
-            diff[1] -= self.height
-        elif diff[1] < -self.height / 2:
-            diff[1] += self.height
+        # Survival penalties
+        rewards -= (self.hunger < 0.1).astype(np.float32) * 0.5  # starving penalty
+        rewards -= (self.energy < 0.1).astype(np.float32) * 0.3  # exhausted penalty
 
-        distance = np.linalg.norm(diff)
-        reward += distance * self.distance_bonus
+        return rewards
+
+    def _compute_exploration_reward(self) -> np.ndarray:
+        """Compute exploration bonus for each fish visiting new grid cells."""
+        rewards = np.zeros(self.num_fish, dtype=np.float32)
+
+        for i in range(self.num_fish):
+            grid_x = int(self.pos[i, 0] / self.grid_size)
+            grid_y = int(self.pos[i, 1] / self.grid_size)
+            cell = (grid_x, grid_y)
+
+            if cell not in self.visited_cells[i]:
+                self.visited_cells[i].add(cell)
+                rewards[i] += self.visit_bonus
+
+            diff = self.pos[i] - self.prev_pos[i]
+            if diff[0] > self.width / 2:
+                diff[0] -= self.width
+            elif diff[0] < -self.width / 2:
+                diff[0] += self.width
+            if diff[1] > self.height / 2:
+                diff[1] -= self.height
+            elif diff[1] < -self.height / 2:
+                diff[1] += self.height
+
+            distance = np.linalg.norm(diff)
+            rewards[i] += distance * self.distance_bonus
 
         self.prev_pos = self.pos.copy()
-        return reward
+        return rewards
 
     def _spawn_food(self, count: int):
         """Spawn new food items at random positions."""
@@ -409,15 +716,13 @@ class FishEnv(gym.Env):
                 break
             x = self.np_random.uniform(0, self.width)
             y = self.np_random.uniform(0, self.height)
-            self.food[self.food_count] = [x, y, 0.0]  # x, y, age=0
+            self.food[self.food_count] = [x, y, 0.0]
             self.food_count += 1
 
     def render(self):
         """Render the environment (placeholder for now)."""
         if self.render_mode == "rgb_array":
-            # Return a simple visualization
             import warnings
-
             warnings.warn("RGB rendering not implemented yet")
             return np.zeros((self.height, self.width, 3), dtype=np.uint8)
         return None
