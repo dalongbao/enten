@@ -3,11 +3,11 @@
  * Exact visual parity with SDL2 renderer.c
  */
 
-const FISH_LENGTH = 30.0;
-const FISH_WIDTH = 12.0;
-const TAIL_LENGTH = 15.0;
-const TAIL_WIDTH = 8.0;
-const FIN_LENGTH = 10.0;
+const FISH_LENGTH = 120.0;
+const FISH_WIDTH = 48.0;
+const TAIL_LENGTH = 60.0;
+const TAIL_WIDTH = 32.0;
+const FIN_LENGTH = 40.0;
 
 // Colors (normalized to 0-1)
 const COLOR_BG = [20/255, 30/255, 60/255, 1.0];
@@ -208,7 +208,7 @@ class Renderer {
         this._drawLines(outlineVerts, COLOR_OUTLINE);
 
         // Draw pectoral fins
-        const pec_offset = 5.0;
+        const pec_offset = 13.0;
         const finVerts = [];
         for (const side of [-1, 1]) {
             const pec_val = (side < 0) ? leftPec : rightPec;
@@ -224,13 +224,13 @@ class Renderer {
         this._drawLines(finVerts, COLOR_OUTLINE);
 
         // Draw eye
-        const eye_offset = 8;
-        const eye_x = x + cos_a * eye_offset - sin_a * 4;
-        const eye_y = y + sin_a * eye_offset + cos_a * 4;
+        const eye_offset = 21;
+        const eye_x = x + cos_a * eye_offset - sin_a * 11;
+        const eye_y = y + sin_a * eye_offset + cos_a * 11;
 
-        // White of eye (radius 3)
-        this._drawTriangles(this._circleVertices(eye_x, eye_y, 3, 12), COLOR_WHITE);
-        // Pupil (radius 1)
-        this._drawTriangles(this._circleVertices(eye_x, eye_y, 1, 8), COLOR_BLACK);
+        // White of eye (radius 8)
+        this._drawTriangles(this._circleVertices(eye_x, eye_y, 8, 12), COLOR_WHITE);
+        // Pupil (radius 3)
+        this._drawTriangles(this._circleVertices(eye_x, eye_y, 3, 8), COLOR_BLACK);
     }
 }

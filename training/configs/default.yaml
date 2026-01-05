@@ -1,23 +1,32 @@
 # Digital Goldfish Training Configuration
+#
+# Multi-fish environment with shared policy
+# Each fish has 60 observation features:
+#   - Raycasts: 32 (16 rays x 2)
+#   - Lateral line: 16 (8 sensors x 2)
+#   - Proprioception: 4
+#   - Internal state: 4
+#   - Social: 4 (nearest_dist, nearest_angle, num_nearby, heading_diff)
+#
+# Action space (3D per fish):
+#   - speed [0, 1]: Desired forward speed
+#   - direction [-1, 1]: Turn rate
+#   - urgency [0, 1]: Movement intensity
+#
+# Device: Auto-selects MPS (Mac) > CUDA > CPU
 
 # Environment
 env:
-  width: 1600
-  height: 1200
+  width: 800
+  height: 600
   max_steps: 2000
   initial_food: 8
-  food_spawn_rate: 0.005
-
-  # Hunger mechanic
-  hunger:
-    initial: 1.0
-    decay_rate: 0.001      # ~16s to starve at 60fps
-    eat_restore: 0.3       # 3-4 foods to satiate
-    penalty_scale: 0.01
+  food_spawn_rate: 0.02
+  num_fish: 3  # Number of fish per environment
 
   # Exploration reward
   exploration:
-    grid_size: 100         # 16x12 cells
+    grid_size: 100
     visit_bonus: 0.05
     distance_bonus: 0.001
 
@@ -36,13 +45,13 @@ ppo:
   gamma: 0.99           # Discount factor
   gae_lambda: 0.95      # GAE lambda
   clip_coef: 0.2        # PPO clip coefficient
-  ent_coef: 0.05        # Entropy coefficient (increased for exploration)
+  ent_coef: 0.05        # Entropy coefficient
   vf_coef: 0.5          # Value function coefficient
   max_grad_norm: 0.5    # Gradient clipping
 
 # Training
 training:
-  total_timesteps: 1_000_000
+  total_timesteps: 10_000_000  # 10M steps
   num_steps: 128        # Steps per rollout
   num_minibatches: 4    # Minibatches per update
   update_epochs: 4      # Epochs per update

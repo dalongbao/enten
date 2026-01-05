@@ -40,7 +40,7 @@
 - [x] **3.5** Update `src/Makefile` - build new file structure (depends: 3.4)
 
 ### Phase 4: Training & Validation
-- [ ] **4.1** Run initial training, tune hyperparameters (depends: 2.3)
+- [x] **4.1** Run extended training (2M steps) - Avg 10.2 food/ep, model at `checkpoints/policy_final.pt`
 - [ ] **4.2** Validate physics match between Python and C (depends: 3.4, 4.1)
 
 ### Phase 5: Browser Integration (LATER)
