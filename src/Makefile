@@ -1,6 +1,6 @@
 EMCC = emcc
 CFLAGS = -O2
-SRC = main.c fish.c
+SRC = main.c fish.c simulator.c
 OUT = build/index.html
 
 all: $(OUT)
