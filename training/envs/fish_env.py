@@ -12,7 +12,8 @@ Perception:
 - 16 raycasts in 180° frontal arc → 32 features
 - 8 lateral line sensors (4 per side) → 16 features
 - 3 proprioceptive features (forward vel, lateral vel, angular vel)
-- Total: 51 features
+- 1 hunger feature
+- Total: 52 features
 """
 
 import numpy as np
@@ -31,8 +32,8 @@ class FishEnv(gym.Env):
     MAX_RAY_LENGTH = 200.0
     NUM_LATERAL_SENSORS = 8
 
-    # Observation: raycasts (32) + lateral (16) + proprio (3) = 51
-    OBS_DIM = NUM_RAYS * 2 + NUM_LATERAL_SENSORS * 2 + 3
+    # Observation: raycasts (32) + lateral (16) + proprio (3) + hunger (1) = 52
+    OBS_DIM = NUM_RAYS * 2 + NUM_LATERAL_SENSORS * 2 + 3 + 1
 
     def __init__(self, config=None, render_mode=None):
         super().__init__()
@@ -69,6 +70,19 @@ class FishEnv(gym.Env):
         # Episode settings
         self.max_steps = self.config.get("max_steps", 1000)
 
+        # Hunger parameters
+        hunger_config = self.config.get("hunger", {})
+        self.hunger_initial = hunger_config.get("initial", 1.0)
+        self.hunger_decay_rate = hunger_config.get("decay_rate", 0.001)
+        self.hunger_eat_restore = hunger_config.get("eat_restore", 0.3)
+        self.hunger_penalty_scale = hunger_config.get("penalty_scale", 0.01)
+
+        # Exploration parameters
+        exploration_config = self.config.get("exploration", {})
+        self.grid_size = exploration_config.get("grid_size", 100)
+        self.visit_bonus = exploration_config.get("visit_bonus", 0.05)
+        self.distance_bonus = exploration_config.get("distance_bonus", 0.001)
+
         # State (initialized in reset)
         self.pos = None
         self.vel = None
@@ -77,6 +91,13 @@ class FishEnv(gym.Env):
         self.food = None  # (max_food, 3): x, y, age
         self.food_count = 0
         self.steps = 0
+
+        # Hunger state
+        self.hunger = None
+
+        # Exploration state
+        self.visited_cells = None
+        self.prev_pos = None
 
     def reset(self, seed=None, options=None):
         super().reset(seed=seed)
@@ -99,6 +120,13 @@ class FishEnv(gym.Env):
 
         self.steps = 0
 
+        # Initialize hunger
+        self.hunger = self.hunger_initial
+
+        # Initialize exploration tracking
+        self.visited_cells = set()
+        self.prev_pos = self.pos.copy()
+
         return self._get_obs(), {}
 
     def step(self, action):
@@ -112,8 +140,17 @@ class FishEnv(gym.Env):
         if self.food_count > 0:
             self.food[: self.food_count, 2] += self.dt
 
-        # Check for food eating
+        # Check for food eating (also restores hunger)
         reward = self._check_eating()
+
+        # Add exploration reward
+        reward += self._compute_exploration_reward()
+
+        # Apply hunger decay and penalty
+        self.hunger -= self.hunger_decay_rate
+        self.hunger = max(0.0, self.hunger)
+        hunger_penalty = self.hunger_penalty_scale * (1.0 - min(1.0, self.hunger))
+        reward -= hunger_penalty
 
         # Spawn new food occasionally
         spawn_rate = self.config.get("food_spawn_rate", 0.02)
@@ -184,9 +221,12 @@ class FishEnv(gym.Env):
         vel_lateral = np.dot(self.vel, perpendicular) / 100.0
         angular_vel_norm = self.angular_vel / self.turn_rate
 
-        obs[-3] = np.clip(vel_forward, -1, 1)
-        obs[-2] = np.clip(vel_lateral, -1, 1)
-        obs[-1] = np.clip(angular_vel_norm, -1, 1)
+        obs[-4] = np.clip(vel_forward, -1, 1)
+        obs[-3] = np.clip(vel_lateral, -1, 1)
+        obs[-2] = np.clip(angular_vel_norm, -1, 1)
+
+        # Hunger (1 feature)
+        obs[-1] = np.clip(self.hunger, 0.0, 1.0)
 
         return obs
 
@@ -320,12 +360,46 @@ class FishEnv(gym.Env):
 
             if dist < self.eat_radius:
                 reward += 1.0
+                # Restore hunger (no cap - overeating allowed like real goldfish)
+                self.hunger += self.hunger_eat_restore
                 # Remove food by swapping with last
                 self.food[i] = self.food[self.food_count - 1]
                 self.food_count -= 1
             else:
                 i += 1
 
+        return reward
+
+    def _compute_exploration_reward(self):
+        """Compute exploration bonus for visiting new grid cells and moving."""
+        reward = 0.0
+
+        # Grid cell visit bonus
+        grid_x = int(self.pos[0] / self.grid_size)
+        grid_y = int(self.pos[1] / self.grid_size)
+        cell = (grid_x, grid_y)
+
+        if cell not in self.visited_cells:
+            self.visited_cells.add(cell)
+            reward += self.visit_bonus
+
+        # Distance traveled bonus (with wraparound handling)
+        diff = self.pos - self.prev_pos
+
+        # Handle wraparound
+        if diff[0] > self.width / 2:
+            diff[0] -= self.width
+        elif diff[0] < -self.width / 2:
+            diff[0] += self.width
+        if diff[1] > self.height / 2:
+            diff[1] -= self.height
+        elif diff[1] < -self.height / 2:
+            diff[1] += self.height
+
+        distance = np.linalg.norm(diff)
+        reward += distance * self.distance_bonus
+
+        self.prev_pos = self.pos.copy()
         return reward
 
     def _spawn_food(self, count: int):

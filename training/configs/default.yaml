@@ -2,11 +2,24 @@
 
 # Environment
 env:
-  width: 800
-  height: 600
-  max_steps: 1000
-  initial_food: 5
-  food_spawn_rate: 0.02
+  width: 1600
+  height: 1200
+  max_steps: 2000
+  initial_food: 8
+  food_spawn_rate: 0.005
+
+  # Hunger mechanic
+  hunger:
+    initial: 1.0
+    decay_rate: 0.001      # ~16s to starve at 60fps
+    eat_restore: 0.3       # 3-4 foods to satiate
+    penalty_scale: 0.01
+
+  # Exploration reward
+  exploration:
+    grid_size: 100         # 16x12 cells
+    visit_bonus: 0.05
+    distance_bonus: 0.001
 
 # Vectorized environment
 num_envs: 64
@@ -23,7 +36,7 @@ ppo:
   gamma: 0.99           # Discount factor
   gae_lambda: 0.95      # GAE lambda
   clip_coef: 0.2        # PPO clip coefficient
-  ent_coef: 0.01        # Entropy coefficient
+  ent_coef: 0.05        # Entropy coefficient (increased for exploration)
   vf_coef: 0.5          # Value function coefficient
   max_grad_norm: 0.5    # Gradient clipping
 

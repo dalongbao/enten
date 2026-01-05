@@ -5,7 +5,8 @@ Architecture:
 - Visual encoder: raycast(32) -> 32 -> 16
 - Lateral encoder: lateral(16) -> 16 -> 8
 - Proprioception: 3 features passed through directly
-- Combined: 27 -> 64 -> 64 -> action(2) + value(1)
+- Hunger: 1 feature passed through directly
+- Combined: 28 -> 64 -> 64 -> action(2) + value(1)
 
 Total parameters: ~6,500
 """
@@ -35,7 +36,8 @@ class FishPolicy(nn.Module):
         self.visual_dim = num_rays * 2  # 32
         self.lateral_dim = num_lateral * 2  # 16
         self.proprio_dim = 3
-        self.obs_dim = self.visual_dim + self.lateral_dim + self.proprio_dim  # 51
+        self.hunger_dim = 1
+        self.obs_dim = self.visual_dim + self.lateral_dim + self.proprio_dim + self.hunger_dim  # 52
 
         # Visual encoder (raycasts)
         self.visual_encoder = nn.Sequential(
@@ -53,8 +55,8 @@ class FishPolicy(nn.Module):
             nn.ReLU(),
         )
 
-        # Combined processing (16 + 8 + 3 = 27)
-        combined_dim = 16 + 8 + self.proprio_dim
+        # Combined processing (16 + 8 + 3 + 1 = 28)
+        combined_dim = 16 + 8 + self.proprio_dim + self.hunger_dim
         self.combined = nn.Sequential(
             nn.Linear(combined_dim, hidden_dim),
             nn.ReLU(),
@@ -94,7 +96,7 @@ class FishPolicy(nn.Module):
         Forward pass.
 
         Args:
-            obs: (batch, 51) observation tensor
+            obs: (batch, 52) observation tensor
 
         Returns:
             action_mean: (batch, 2) action means
@@ -104,14 +106,16 @@ class FishPolicy(nn.Module):
         # Split observation into components
         visual = obs[:, : self.visual_dim]
         lateral = obs[:, self.visual_dim : self.visual_dim + self.lateral_dim]
-        proprio = obs[:, -self.proprio_dim :]
+        proprio_start = self.visual_dim + self.lateral_dim
+        proprio = obs[:, proprio_start : proprio_start + self.proprio_dim]
+        hunger = obs[:, -self.hunger_dim :]
 
         # Encode each modality
         visual_feat = self.visual_encoder(visual)  # (batch, 16)
         lateral_feat = self.lateral_encoder(lateral)  # (batch, 8)
 
         # Combine features
-        combined = torch.cat([visual_feat, lateral_feat, proprio], dim=1)  # (batch, 27)
+        combined = torch.cat([visual_feat, lateral_feat, proprio, hunger], dim=1)  # (batch, 28)
         hidden = self.combined(combined)  # (batch, hidden_dim)
 
         # Outputs
@@ -129,7 +133,7 @@ class FishPolicy(nn.Module):
         Sample action from policy.
 
         Args:
-            obs: (batch, 51) observation tensor
+            obs: (batch, 52) observation tensor
             deterministic: if True, return mean action without sampling
 
         Returns:
@@ -171,7 +175,7 @@ class FishPolicy(nn.Module):
         Evaluate log probability of actions (for PPO update).
 
         Args:
-            obs: (batch, 51) observations
+            obs: (batch, 52) observations
             actions: (batch, 2) actions (already bounded)
 
         Returns:

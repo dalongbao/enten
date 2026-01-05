@@ -3,6 +3,8 @@ Vectorized fish environment for fast RL training.
 
 All operations are vectorized using NumPy - no Python loops over environments.
 This enables training on hundreds of parallel environments efficiently.
+
+Observation: raycasts (32) + lateral (16) + proprio (3) + hunger (1) = 52
 """
 
 import numpy as np
@@ -18,7 +20,7 @@ class VecFishEnv:
     RAY_ARC = np.pi  # 180 degrees
     MAX_RAY_LENGTH = 200.0
     NUM_LATERAL_SENSORS = 8
-    OBS_DIM = NUM_RAYS * 2 + NUM_LATERAL_SENSORS * 2 + 3  # 51
+    OBS_DIM = NUM_RAYS * 2 + NUM_LATERAL_SENSORS * 2 + 3 + 1  # 52
 
     def __init__(self, num_envs: int = 64, config: dict = None):
         self.num_envs = num_envs
@@ -62,6 +64,19 @@ class VecFishEnv:
         # Episode settings
         self.max_steps = self.config.get("max_steps", 1000)
 
+        # Hunger parameters
+        hunger_config = self.config.get("hunger", {})
+        self.hunger_initial = hunger_config.get("initial", 1.0)
+        self.hunger_decay_rate = hunger_config.get("decay_rate", 0.001)
+        self.hunger_eat_restore = hunger_config.get("eat_restore", 0.3)
+        self.hunger_penalty_scale = hunger_config.get("penalty_scale", 0.01)
+
+        # Exploration parameters
+        exploration_config = self.config.get("exploration", {})
+        self.grid_size = exploration_config.get("grid_size", 100)
+        self.visit_bonus = exploration_config.get("visit_bonus", 0.05)
+        self.distance_bonus = exploration_config.get("distance_bonus", 0.001)
+
         # Pre-compute ray angles (relative to heading)
         t = np.linspace(0, 1, self.NUM_RAYS)
         self.ray_angles_rel = (t - 0.5) * self.RAY_ARC  # [-pi/2, pi/2]
@@ -95,6 +110,13 @@ class VecFishEnv:
 
         self.steps = np.zeros(n, dtype=np.int32)
 
+        # Hunger state
+        self.hunger = np.ones(n, dtype=np.float32) * self.hunger_initial
+
+        # Exploration state
+        self.visited_cells = [set() for _ in range(n)]
+        self.prev_pos = np.zeros((n, 2), dtype=np.float32)
+
     def reset(self, seed=None, options=None):
         """Reset all environments."""
         if seed is not None:
@@ -115,6 +137,13 @@ class VecFishEnv:
         # Spawn initial food
         initial_food = self.config.get("initial_food", 5)
         self._spawn_food_all(initial_food)
+
+        # Initialize hunger
+        self.hunger = np.ones(n, dtype=np.float32) * self.hunger_initial
+
+        # Initialize exploration
+        self.visited_cells = [set() for _ in range(n)]
+        self.prev_pos = self.pos.copy()
 
         return self._get_obs(), {}
 
@@ -141,6 +170,14 @@ class VecFishEnv:
         for idx in indices:
             self._spawn_food_single(idx, initial_food)
 
+        # Reset hunger
+        self.hunger[indices] = self.hunger_initial
+
+        # Reset exploration
+        for idx in indices:
+            self.visited_cells[idx] = set()
+        self.prev_pos[indices] = self.pos[indices].copy()
+
     def step(self, actions: np.ndarray):
         """Step all environments with given actions."""
         actions = np.asarray(actions, dtype=np.float32)
@@ -155,8 +192,17 @@ class VecFishEnv:
             if self.food_count[i] > 0:
                 self.food[i, :self.food_count[i], 2] += self.dt
 
-        # Check eating (returns rewards)
+        # Check eating (returns rewards, also restores hunger)
         rewards = self._check_eating_vec()
+
+        # Add exploration reward
+        rewards += self._compute_exploration_vec()
+
+        # Apply hunger decay and penalty
+        self.hunger -= self.hunger_decay_rate
+        self.hunger = np.maximum(0.0, self.hunger)
+        hunger_penalty = self.hunger_penalty_scale * (1.0 - np.minimum(1.0, self.hunger))
+        rewards -= hunger_penalty
 
         # Spawn new food occasionally
         spawn_rate = self.config.get("food_spawn_rate", 0.02)
@@ -235,9 +281,12 @@ class VecFishEnv:
         vel_lateral = np.sum(self.vel * perpendicular, axis=1) / 100.0
         angular_vel_norm = self.angular_vel / self.turn_rate
 
-        obs[:, -3] = np.clip(vel_forward, -1, 1)
-        obs[:, -2] = np.clip(vel_lateral, -1, 1)
-        obs[:, -1] = np.clip(angular_vel_norm, -1, 1)
+        obs[:, -4] = np.clip(vel_forward, -1, 1)
+        obs[:, -3] = np.clip(vel_lateral, -1, 1)
+        obs[:, -2] = np.clip(angular_vel_norm, -1, 1)
+
+        # Hunger (1 feature)
+        obs[:, -1] = np.clip(self.hunger, 0.0, 1.0)
 
         return obs
 
@@ -378,12 +427,47 @@ class VecFishEnv:
 
                 if dist < self.eat_radius:
                     rewards[env_idx] += 1.0
+                    # Restore hunger (no cap - overeating allowed like real goldfish)
+                    self.hunger[env_idx] += self.hunger_eat_restore
                     # Swap with last
                     self.food[env_idx, i] = self.food[env_idx, self.food_count[env_idx] - 1]
                     self.food_count[env_idx] -= 1
                 else:
                     i += 1
 
+        return rewards
+
+    def _compute_exploration_vec(self) -> np.ndarray:
+        """Compute exploration rewards for all environments."""
+        rewards = np.zeros(self.num_envs, dtype=np.float32)
+
+        for env_idx in range(self.num_envs):
+            # Grid cell visit bonus
+            grid_x = int(self.pos[env_idx, 0] / self.grid_size)
+            grid_y = int(self.pos[env_idx, 1] / self.grid_size)
+            cell = (grid_x, grid_y)
+
+            if cell not in self.visited_cells[env_idx]:
+                self.visited_cells[env_idx].add(cell)
+                rewards[env_idx] += self.visit_bonus
+
+            # Distance traveled bonus (with wraparound handling)
+            diff = self.pos[env_idx] - self.prev_pos[env_idx]
+
+            # Handle wraparound
+            if diff[0] > self.width / 2:
+                diff[0] -= self.width
+            elif diff[0] < -self.width / 2:
+                diff[0] += self.width
+            if diff[1] > self.height / 2:
+                diff[1] -= self.height
+            elif diff[1] < -self.height / 2:
+                diff[1] += self.height
+
+            distance = np.linalg.norm(diff)
+            rewards[env_idx] += distance * self.distance_bonus
+
+        self.prev_pos = self.pos.copy()
         return rewards
 
     def _spawn_food_all(self, count: int):
