@@ -1,46 +1,28 @@
-#include <stdio.h>
-#include <stdbool.h>
+#include "simulator.h"
+#include "renderer.h"
 #include <SDL.h>
 #include <emscripten.h>
 #include <emscripten/html5.h>
-#include "fish.h"
+#include <stdbool.h>
+#include <stdio.h>
 
 #define MIN_WIDTH 256
 #define MIN_HEIGHT 256
+#define FRAME_DT (1.0f / 60.0f)
 
-SDL_Window *gWindow = NULL;
-SDL_Renderer *gRenderer = NULL;
-Fish gFish;
-int gScreenWidth = 1920;
-int gScreenHeight = 1080;
-float gThrust = 0.5f;
-float gTurn = 0.0f;
-Vec2 Food[MAX_FOOD];
-int gFoodCount = 0;
+// Global state
+static Simulation gSim;
+static Renderer gRenderer;
+static int gScreenWidth = 1920;
+static int gScreenHeight = 1080;
+static float gThrust = 0.5f;
+static float gTurn = 0.0f;
 
-void cull_food() {
-    for (int i = 0; i < gFoodCount; i++) {
-        if (Food[i].x >= gScreenWidth || Food[i].y >= gScreenHeight) {
-            Food[i] = Food[gFoodCount - 1];
-            gFoodCount--;
-            i--;
-        }
-    }
-}
+// Forward declarations
+static EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data);
+static void main_loop(void);
 
-EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data) {
-    (void)type; (void)e; (void)data;
-    double w = EM_ASM_DOUBLE({ return window.innerWidth; });
-    double h = EM_ASM_DOUBLE({ return window.innerHeight; });
-    gScreenWidth = (int)w < MIN_WIDTH ? MIN_WIDTH : (int)w;
-    gScreenHeight = (int)h < MIN_HEIGHT ? MIN_HEIGHT : (int)h;
-    emscripten_set_canvas_element_size("#canvas", gScreenWidth, gScreenHeight);
-    SDL_SetWindowSize(gWindow, gScreenWidth, gScreenHeight);
-    cull_food();
-    if (gFish.state.pos.x >= gScreenWidth) gFish.state.pos.x = gScreenWidth - 1;
-    if (gFish.state.pos.y >= gScreenHeight) gFish.state.pos.y = gScreenHeight - 1;
-    return EM_TRUE;
-}
+// --- WASM Exports ---
 
 EMSCRIPTEN_KEEPALIVE
 void set_action(float thrust, float turn) {
@@ -49,120 +31,123 @@ void set_action(float thrust, float turn) {
 }
 
 EMSCRIPTEN_KEEPALIVE
-float get_x(void) { return gFish.state.pos.x; }
+float get_x(void) { return gSim.fish.state.pos.x; }
 
 EMSCRIPTEN_KEEPALIVE
-float get_y(void) { return gFish.state.pos.y; }
+float get_y(void) { return gSim.fish.state.pos.y; }
 
 EMSCRIPTEN_KEEPALIVE
-float get_angle(void) { return gFish.state.angle; }
+float get_angle(void) { return gSim.fish.state.angle; }
 
 EMSCRIPTEN_KEEPALIVE
-float get_vx(void) { return gFish.state.vel.x; }
+float get_vx(void) { return gSim.fish.state.vel.x; }
 
 EMSCRIPTEN_KEEPALIVE
-float get_vy(void) { return gFish.state.vel.y; }
+float get_vy(void) { return gSim.fish.state.vel.y; }
 
 EMSCRIPTEN_KEEPALIVE
-int get_food_count(void) { return gFoodCount; }
+int get_food_count(void) { return gSim.food_count; }
 
+EMSCRIPTEN_KEEPALIVE
 void drop_food(int x, int y) {
-    if (gFoodCount >= MAX_FOOD) return;
-    Food[gFoodCount].x = (float)x;
-    Food[gFoodCount].y = (float)y;
-    gFoodCount++;
+    sim_add_food(&gSim, (float)x, (float)y);
 }
 
-void eat_food() {
-    float eat_radius = 25.0f;
-    for (int i = 0; i < gFoodCount; i++) {
-        float dx = gFish.state.pos.x - Food[i].x;
-        float dy = gFish.state.pos.y - Food[i].y;
-        if (dx*dx + dy*dy < eat_radius*eat_radius) {
-            Food[i] = Food[gFoodCount - 1];
-            gFoodCount--;
-            i--;
-        }
-    }
+// --- Event Handlers ---
+
+static EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data) {
+    (void)type;
+    (void)e;
+    (void)data;
+
+    double w = EM_ASM_DOUBLE({ return window.innerWidth; });
+    double h = EM_ASM_DOUBLE({ return window.innerHeight; });
+
+    gScreenWidth = (int)w < MIN_WIDTH ? MIN_WIDTH : (int)w;
+    gScreenHeight = (int)h < MIN_HEIGHT ? MIN_HEIGHT : (int)h;
+
+    emscripten_set_canvas_element_size("#canvas", gScreenWidth, gScreenHeight);
+    renderer_resize(&gRenderer, gScreenWidth, gScreenHeight);
+
+    // Update simulation dimensions
+    gSim.screen_width = gScreenWidth;
+    gSim.screen_height = gScreenHeight;
+    sim_cull_food(&gSim);
+
+    // Clamp fish position
+    if (gSim.fish.state.pos.x >= gScreenWidth)
+        gSim.fish.state.pos.x = gScreenWidth - 1;
+    if (gSim.fish.state.pos.y >= gScreenHeight)
+        gSim.fish.state.pos.y = gScreenHeight - 1;
+
+    return EM_TRUE;
 }
 
-bool init() {
-    bool success = true;
-    if (SDL_Init(SDL_INIT_VIDEO) < 0) {
-        printf("SDL failed to init: %s\n", SDL_GetError());
-        return false;
-    }
+// --- Main Loop ---
 
-    gWindow = SDL_CreateWindow("goldfish", 0, 0, gScreenWidth, gScreenHeight, 0);
-    if (gWindow == NULL) {
-      printf("Window could not be created: %s\n", SDL_GetError());
-        return false;
-    }
-
-    gRenderer = SDL_CreateRenderer(gWindow, -1, SDL_RENDERER_ACCELERATED);
-    if (gRenderer == NULL) {
-        printf("Renderer could not be created :%s\n", SDL_GetError());
-        return false;
-    }
-
-    emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, NULL, EM_FALSE, on_resize);
-    on_resize(0, NULL, NULL);
-    gFish = fish_create(gScreenWidth/2, gScreenHeight/2);
-    printf("Init: screen %dx%d, fish at %.1f,%.1f\n", gScreenWidth, gScreenHeight, gFish.state.pos.x, gFish.state.pos.y);
-    return success;
-}
-
-void task_loop() {
+static void main_loop(void) {
+    // Handle events
     SDL_Event e;
     while (SDL_PollEvent(&e)) {
         if (e.type == SDL_QUIT) {
             emscripten_cancel_main_loop();
         } else if (e.type == SDL_MOUSEBUTTONDOWN) {
-            int x = e.button.x;
-            int y = e.button.y;
-            drop_food(x, y);
+            drop_food(e.button.x, e.button.y);
         }
     }
 
-    fish_update(&gFish, gThrust, gTurn, 1.0f/60.0f, gScreenWidth, gScreenHeight);
-    eat_food();
+    // Step simulation
+    sim_step(&gSim, gThrust, gTurn);
 
-    SDL_SetRenderDrawColor(gRenderer, 20, 30, 60, 255);
-    SDL_RenderClear(gRenderer);
+    // Render
+    renderer_clear(&gRenderer);
 
-    SDL_SetRenderDrawColor(gRenderer, 100, 200, 100, 255);
-    for (int i = 0; i < gFoodCount; i++) {
-        SDL_Rect food_rect = {(int)Food[i].x - 5, (int)Food[i].y - 5, 10, 10};
-        SDL_RenderFillRect(gRenderer, &food_rect);
+    // Draw food (extract positions for renderer)
+    Vec2 food_positions[MAX_FOOD];
+    for (int i = 0; i < gSim.food_count; i++) {
+        food_positions[i] = gSim.food[i].pos;
+    }
+    renderer_draw_all_food(&gRenderer, food_positions, gSim.food_count);
+
+    // Draw fish
+    renderer_draw_fish(&gRenderer, &gSim.fish);
+
+    renderer_present(&gRenderer);
+}
+
+// --- Initialization ---
+
+static bool init(void) {
+    // Initialize renderer
+    if (!renderer_init(&gRenderer, "goldfish", gScreenWidth, gScreenHeight)) {
+        printf("Failed to initialize renderer\n");
+        return false;
     }
 
-    SDL_SetRenderDrawColor(gRenderer, 255, 160, 50, 255);
-    SDL_Rect fish_rect = {
-        (int)gFish.state.pos.x - 15,
-        (int)gFish.state.pos.y - 8,
-        30, 16
-    };
-    SDL_RenderFillRect(gRenderer, &fish_rect);
+    // Set up resize callback and trigger initial resize
+    emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, NULL, EM_FALSE, on_resize);
+    on_resize(0, NULL, NULL);
 
-    SDL_RenderPresent(gRenderer); 
+    // Initialize simulation
+    sim_init(&gSim, gScreenWidth, gScreenHeight, FRAME_DT);
+
+    printf("Init: screen %dx%d, fish at %.1f,%.1f\n",
+           gScreenWidth, gScreenHeight,
+           gSim.fish.state.pos.x, gSim.fish.state.pos.y);
+
+    return true;
 }
 
-void close() {
-    SDL_DestroyRenderer(gRenderer);
-    gRenderer = NULL;
-    SDL_DestroyWindow(gWindow);
-    gWindow = NULL;
+int main(int argc, char *args[]) {
+    (void)argc;
+    (void)args;
 
-    SDL_Quit();
-}
-
-int main(int argc, char* args[]) {
     if (!init()) {
-        printf("failed to init");
+        printf("Failed to init\n");
         return 1;
-    } 
+    }
 
-    emscripten_set_main_loop(task_loop, 0, 1);
-    close();
+    emscripten_set_main_loop(main_loop, 0, 1);
+    renderer_close(&gRenderer);
     return 0;
 }

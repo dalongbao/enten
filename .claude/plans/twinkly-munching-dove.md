@@ -36,7 +36,7 @@
 - [x] **3.1** Create `src/fish.c` - extract physics from fish.h, add perception functions
 - [x] **3.2** Create `src/simulator.c` - environment state and logic (depends: 3.1)
 - [x] **3.3** Create `src/renderer.c` - extract SDL2 rendering from main.c (depends: 3.1)
-- [ ] **3.4** Update `src/main.c` - entry point only, use new modules (depends: 3.1, 3.2, 3.3)
+- [x] **3.4** Update `src/main.c` - entry point only, use new modules (depends: 3.1, 3.2, 3.3)
 - [ ] **3.5** Update `src/Makefile` - build new file structure (depends: 3.4)
 
 ### Phase 4: Training & Validation
