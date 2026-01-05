@@ -2,8 +2,6 @@
 #define FISH_H
 #include <math.h>
 
-#define SCREEN_WIDTH 640
-#define SCREEN_HEIGHT 480
 #define MAX_FOOD 32
 
 typedef struct {
@@ -11,104 +9,113 @@ typedef struct {
     float y;
 } Vec2;
 
+// Goldfish variety types
+typedef enum {
+    GOLDFISH_COMMON,    // Balanced, medium speed
+    GOLDFISH_COMET,     // Small fins, fast & agile
+    GOLDFISH_FANCY      // Large fins, slow & graceful
+} GoldfishVariety;
+
+// Physical parameters - vary by goldfish type
 typedef struct {
-    float mass;
-    float drag_coeff;
-    float max_thrust;
-    float turn_rate;
-    float length;
+    float body_length;      // Visual length in pixels
+    float fin_area_mult;    // Fin size multiplier (affects thrust & drag)
+    float thrust_coeff;     // Base thrust coefficient
+    float drag_coeff;       // Base drag coefficient
+    float turn_rate;        // Max angular velocity
+    float mass;             // Body mass
 } FishParams;
 
+// Tail animation state (computed from movement, not directly controlled)
 typedef struct {
-    float phase;
-    float frequency;
-    float amplitude;
+    float phase;            // Current oscillation phase [0, 2pi]
+    float frequency;        // Current beat frequency (Hz)
+    float amplitude;        // Current tail swing amplitude
 } TailState;
 
+// Internal homeostasis state (for equilibrium reward)
+typedef struct {
+    float hunger;           // [0, 1] - 0=starving, 1=satiated
+    float stress;           // [0, 1] - 0=calm, 1=panicked
+    float social_comfort;   // [0, 1] - 0=lonely/crowded, 1=comfortable
+    float energy;           // [0, 1] - 0=exhausted, 1=rested
+} FishInternalState;
+
+// Dynamic state
 typedef struct {
     Vec2 pos;
     Vec2 vel;
     float angle;
     float angular_vel;
+    float current_speed;        // Actual speed (magnitude of velocity)
     TailState tail;
+    // Animated fin positions (computed from movement)
+    float body_curve;           // Body curvature for rendering [-1, 1]
+    float left_pectoral;        // Left fin angle for rendering
+    float right_pectoral;       // Right fin angle for rendering
+    // Internal state
+    FishInternalState internal;
 } FishState;
 
 typedef struct {
     FishParams params;
     FishState state;
+    GoldfishVariety variety;
 } Fish;
 
-static inline FishParams fish_default_params(void) {
-    return (FishParams){
-        .mass = 1.0f,
-        .drag_coeff = 2.0f,
-        .max_thrust = 500.0f,
-        .turn_rate = 3.0f,
-        .length = 30.0f
-    };
-}
+// === Goldfish variety presets ===
+FishParams goldfish_common_params(void);   // Balanced
+FishParams goldfish_comet_params(void);    // Fast & agile
+FishParams goldfish_fancy_params(void);    // Slow & graceful
 
-static inline Fish fish_create(float x, float y) {
-    return (Fish){
-        .params = fish_default_params(),
-        .state = {
-            .pos = {x, y},
-            .vel = {0.0f, 0.0f},
-            .angle = 0.0f,
-            .angular_vel = 0.0f,
-            .tail = {0.0f, 2.0f, 0.0f}
-        }
-    };
-}
+// === Core functions ===
+Fish fish_create(float x, float y, GoldfishVariety variety);
 
-static inline void fish_update(Fish* fish, float thrust, float turn, float dt, int screen_w, int screen_h) {
-    FishState* s = &fish->state;
-    const FishParams* p = &fish->params;
+// New hybrid physics: model outputs speed/direction/urgency
+// Fin animation is computed automatically from movement
+void fish_update(
+    Fish* fish,
+    float speed,        // [0, 1] - desired forward speed
+    float direction,    // [-1, 1] - turn rate (-1=left, +1=right)
+    float urgency,      // [0, 1] - movement intensity (affects frequency)
+    float dt,
+    int screen_w,
+    int screen_h
+);
 
-    s->tail.amplitude = thrust;
-    s->tail.phase += s->tail.frequency * 2.0f * M_PI * dt;
-    if (s->tail.phase > 2.0f * M_PI) {
-        s->tail.phase -= 2.0f * M_PI;
-    }
+// === Perception functions ===
+// Cast rays to detect food AOE, output is [distance, intensity] pairs
+void fish_cast_rays(
+    const Fish* fish,
+    const Vec2* food_positions,
+    const float* food_ages,
+    int food_count,
+    int num_rays,
+    float arc_radians,
+    float max_distance,
+    float* output  // size: num_rays * 2
+);
 
-    s->angular_vel = turn * p->turn_rate;
-    s->angle += s->angular_vel * dt;
+// Compute lateral line pressure gradients from nearby food
+void fish_sense_lateral(
+    const Fish* fish,
+    const Vec2* food_positions,
+    const float* food_ages,
+    int food_count,
+    int num_sensors,
+    float* output  // size: num_sensors * 2
+);
 
-    float thrust_force = thrust * p->max_thrust;
-    float fx = thrust_force * cosf(s->angle);
-    float fy = thrust_force * sinf(s->angle);
+// Get proprioceptive features: [forward_vel, lateral_vel, angular_vel, speed]
+void fish_get_proprioception(
+    const Fish* fish,
+    float* output  // size: 4
+);
 
-    float speed = sqrtf(s->vel.x * s->vel.x + s->vel.y * s->vel.y);
-    if (speed > 0.0001f) {
-        float drag = p->drag_coeff * speed;
-        fx -= drag * (s->vel.x / speed);
-        fy -= drag * (s->vel.y / speed);
-    }
-
-    float ax = fx / p->mass;
-    float ay = fy / p->mass;
-
-    s->vel.x += ax * dt;
-    s->vel.y += ay * dt;
-    s->pos.x += s->vel.x * dt;
-    s->pos.y += s->vel.y * dt;
-
-    if (s->pos.x < 0) s->pos.x += screen_w;
-    if (s->pos.x >= screen_w) s->pos.x -= screen_w;
-    if (s->pos.y < 0) s->pos.y += screen_h;
-    if (s->pos.y >= screen_h) s->pos.y -= screen_h;
-}
-
-static inline float fish_speed(const Fish* fish) {
-    const Vec2* v = &fish->state.vel;
-    return sqrtf(v->x * v->x + v->y * v->y);
-}
-
-static inline float fish_tail_offset(const Fish* fish) {
-    const TailState* t = &fish->state.tail;
-    return t->amplitude * sinf(t->phase);
-}
-
-
+// Get internal state features: [hunger, stress, social_comfort, energy]
+void fish_get_internal_state(
+    const Fish* fish,
+    float* output  // size: 4
+);
 
 #endif

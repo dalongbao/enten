@@ -1,0 +1,10 @@
+Using device: mps
+Created 64 parallel environments with 3 fish each
+Per-fish obs dim: 60, action dim: 3
+Policy parameters: 8,783
+Total updates: 1220
+Batch size: 8192, Fish batch size: 24576
+Minibatch size: 2048, Fish minibatch size: 6144
+Update    10 | Steps    81920 | FPS    258 | Reward 0.231 | PG 0.3174 | VF 1.1565 | Ent 4.3859 | Clip 0.815
+Update    20 | Steps   163840 | FPS    234 | Reward 0.282 | PG 0.3085 | VF 0.3438 | Ent 4.4910 | Clip 0.810
+Update    30 | Steps   245760 | FPS    216 | Reward 0.282 | PG 0.3109 | VF 1.1613 | Ent 4.6303 | Clip 0.809

@@ -8,16 +8,315 @@
 * { margin: 0; padding: 0; }
 html, body { width: 100%; height: 100%; overflow: hidden; background: #141e3c; }
 canvas { display: block; position: absolute; top: 0; left: 0; }
+#status {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  color: #fff;
+  font-family: monospace;
+  font-size: 12px;
+  background: rgba(0,0,0,0.5);
+  padding: 5px 10px;
+  border-radius: 4px;
+  pointer-events: none;
+}
 </style>
 </head>
 <body>
 <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+<div id="status">Loading...</div>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<script src="renderer.js"></script>
 <script>
+// WebGL renderer
+var renderer = null;
+var foodPosPtr = null;
+var MAX_FOOD = 32;
+
 var Module = {
   canvas: document.getElementById('canvas'),
   print: function(t) { console.log(t); },
-  printErr: function(t) { console.error(t); }
+  printErr: function(t) { console.error(t); },
+  onRuntimeInitialized: function() {
+    initRenderer();
+    initBrain();
+  }
 };
+
+// Initialize WebGL renderer
+function initRenderer() {
+  var canvas = document.getElementById('canvas');
+  renderer = new Renderer(canvas);
+
+  // Allocate buffer for food positions
+  foodPosPtr = Module._malloc(MAX_FOOD * 2 * 4); // 2 floats per food, 4 bytes each
+
+  // Handle initial resize
+  handleResize();
+
+  // Start render loop
+  requestAnimationFrame(renderLoop);
+
+  // Add click handler for dropping food
+  canvas.addEventListener('click', function(e) {
+    Module._drop_food(e.clientX, e.clientY);
+  });
+}
+
+// Handle window resize
+function handleResize() {
+  var w = window.innerWidth;
+  var h = window.innerHeight;
+  renderer.resize(w, h);
+}
+
+window.addEventListener('resize', handleResize);
+
+// Render loop - runs independently from WASM physics loop
+function renderLoop() {
+  if (!renderer) {
+    requestAnimationFrame(renderLoop);
+    return;
+  }
+
+  // Query food from WASM
+  var foodCount = Module._get_food_count();
+  Module._get_food_positions(foodPosPtr);
+
+  // Read food positions from WASM memory
+  var foodPositions = new Float32Array(foodCount * 2);
+  for (var i = 0; i < foodCount * 2; i++) {
+    foodPositions[i] = Module.getValue(foodPosPtr + i * 4, 'float');
+  }
+
+  // Render
+  renderer.clear();
+  renderer.drawFood(foodPositions, foodCount);
+
+  // Draw all fish
+  var fishCount = Module._get_fish_count_sim();
+  for (var f = 0; f < fishCount; f++) {
+    var x = Module._get_x_for_fish(f);
+    var y = Module._get_y_for_fish(f);
+    var angle = Module._get_angle_for_fish(f);
+    var tailPhase = Module._get_tail_phase_for_fish(f);
+    var tailAmplitude = Module._get_tail_amplitude_for_fish(f);
+    var bodyCurve = Module._get_body_curve_for_fish(f);
+    var leftPec = Module._get_left_pectoral_for_fish(f);
+    var rightPec = Module._get_right_pectoral_for_fish(f);
+    renderer.drawFish(x, y, angle, tailPhase, tailAmplitude, bodyCurve, leftPec, rightPec);
+  }
+
+  requestAnimationFrame(renderLoop);
+}
+
+// Brain state
+var brain = null;
+var brainEnabled = false;
+var obsPtr = null;
+var OBS_SIZE = 56;  // 32 raycasts + 16 lateral + 4 proprio + 4 internal
+
+// Status display
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+// Initialize the neural network brain
+async function initBrain() {
+  setStatus('Initializing...');
+
+  // Allocate memory for observation buffer
+  obsPtr = Module._malloc(OBS_SIZE * 4); // 4 bytes per float
+
+  // Try to load the ONNX model
+  try {
+    // Check if brain.js is available
+    if (typeof FishBrain !== 'undefined') {
+      brain = new FishBrain();
+      await brain.init('model.onnx');
+      brainEnabled = true;
+      setStatus('AI Brain Active - Click to add food');
+      console.log('Brain loaded successfully');
+
+      // Start the brain loop
+      requestAnimationFrame(brainLoop);
+    } else {
+      // No brain.js, try loading ONNX directly
+      const session = await ort.InferenceSession.create('model.onnx');
+      brain = { session: session };
+      brainEnabled = true;
+      setStatus('AI Brain Active - Click to add food');
+      console.log('ONNX model loaded directly');
+
+      requestAnimationFrame(brainLoop);
+    }
+  } catch (e) {
+    console.log('Brain not available:', e.message);
+    setStatus('Manual: WASD/Arrows=move, Shift=burst, Click=food, B=toggle AI');
+    brainEnabled = false;
+    // Start manual control loop
+    requestAnimationFrame(manualLoop);
+  }
+}
+
+// Debug logging
+var brainFrameCount = 0;
+var LOG_INTERVAL = 60; // Log every 60 frames (~1 second)
+
+// Get observation from WASM and run inference
+async function brainLoop() {
+  if (!brainEnabled || !brain) {
+    return;
+  }
+
+  try {
+    // Get observation from WASM
+    Module._get_observation(obsPtr);
+
+    // Read observation floats from WASM memory
+    var obs = new Float32Array(OBS_SIZE);
+    for (var i = 0; i < OBS_SIZE; i++) {
+      obs[i] = Module.getValue(obsPtr + i * 4, 'float');
+    }
+
+    // Run inference
+    var action;
+    if (brain.predict) {
+      // Using FishBrain wrapper
+      action = await brain.predict(obs);
+    } else {
+      // Direct ONNX inference
+      var inputTensor = new ort.Tensor('float32', obs, [1, OBS_SIZE]);
+      var results = await brain.session.run({ observation: inputTensor });
+      var output = results.action.data;
+      // New 3-action API: speed, direction, urgency
+      action = { speed: output[0], direction: output[1], urgency: output[2] };
+    }
+
+    // Debug logging
+    if (brainFrameCount % LOG_INTERVAL === 0) {
+      console.log('=== Frame', brainFrameCount, '===');
+      console.log('Input obs[0:32] (raycasts):', Array.from(obs.slice(0, 32)).map(v => v.toFixed(2)).join(', '));
+      console.log('Input obs[32:48] (lateral):', Array.from(obs.slice(32, 48)).map(v => v.toFixed(2)).join(', '));
+      console.log('Input obs[48:51] (proprio):', Array.from(obs.slice(48, 51)).map(v => v.toFixed(2)).join(', '));
+      console.log('Input obs[51] (hunger):', obs[51].toFixed(2));
+      console.log('Output action:', {
+        speed: action.speed.toFixed(3),
+        direction: action.direction.toFixed(3),
+        urgency: action.urgency.toFixed(3)
+      });
+    }
+    brainFrameCount++;
+
+    // Apply action (3 controls: speed, direction, urgency)
+    Module._set_action(action.speed, action.direction, action.urgency);
+
+  } catch (e) {
+    console.error('Brain inference error:', e);
+  }
+
+  // Continue loop
+  requestAnimationFrame(brainLoop);
+}
+
+// Manual control state
+var keysDown = {};
+var wanderDirection = 0;      // Random walk state (target)
+var wanderSpeed = 0.9;        // Random walk state (target)
+var smoothDirection = 0;      // Smoothed output
+var smoothSpeed = 0.9;        // Smoothed output
+var wanderTimer = 0;          // Timer for less frequent changes
+
+// Manual control loop
+function manualLoop() {
+  if (brainEnabled) return;
+
+  wanderTimer++;
+
+  // Only update random walk targets every ~30 frames (0.5 sec) for smoother motion
+  if (wanderTimer % 30 === 0) {
+    wanderDirection += (Math.random() - 0.5) * 0.3;
+    wanderDirection *= 0.9; // Drift back toward center
+    wanderDirection = Math.max(-0.5, Math.min(0.5, wanderDirection));
+
+    wanderSpeed += (Math.random() - 0.5) * 0.1;
+    wanderSpeed = Math.max(0.75, Math.min(1.0, wanderSpeed));
+  }
+
+  // Smooth interpolation toward targets (lerp)
+  smoothDirection += (wanderDirection - smoothDirection) * 0.05;
+  smoothSpeed += (wanderSpeed - smoothSpeed) * 0.03;
+
+  var naturalTurn = smoothDirection;
+  var speedVariation = smoothSpeed;
+  var urgencyVariation = 0.5 + smoothSpeed * 0.4;
+
+  // 3 controls: speed, direction, urgency
+  var speed = speedVariation;
+  var direction = naturalTurn;
+  var urgency = urgencyVariation;
+
+  // Check if any movement key is pressed
+  var anyKeyPressed = keysDown['w'] || keysDown['ArrowUp'] ||
+                      keysDown['a'] || keysDown['ArrowLeft'] ||
+                      keysDown['d'] || keysDown['ArrowRight'] ||
+                      keysDown['s'] || keysDown['ArrowDown'];
+
+  // Override with manual controls if keys pressed
+  if (anyKeyPressed) {
+    direction = 0; // Reset meandering when manually controlling
+
+    // W/Up = swim forward faster
+    if (keysDown['w'] || keysDown['ArrowUp']) {
+      speed = 0.8;
+      urgency = 0.6;
+    }
+
+    // A/Left = turn left
+    if (keysDown['a'] || keysDown['ArrowLeft']) {
+      direction = -0.7;
+    }
+    // D/Right = turn right
+    if (keysDown['d'] || keysDown['ArrowRight']) {
+      direction = 0.7;
+    }
+
+    // S/Down = slow down / brake
+    if (keysDown['s'] || keysDown['ArrowDown']) {
+      speed = 0.1;
+      urgency = 0.1;
+    }
+  }
+
+  // Shift = burst mode (high urgency)
+  if (keysDown['Shift']) {
+    urgency = 1.0;
+    if (speed > 0.5) speed = 1.0;
+  }
+
+  Module._set_action(speed, direction, urgency);
+  requestAnimationFrame(manualLoop);
+}
+
+// Keyboard controls
+document.addEventListener('keydown', function(e) {
+  keysDown[e.key] = true;
+
+  if (e.key === 'b' || e.key === 'B') {
+    brainEnabled = !brainEnabled;
+    if (brainEnabled && brain) {
+      setStatus('AI Brain Active - Click to add food');
+      requestAnimationFrame(brainLoop);
+    } else {
+      setStatus('Manual: W/↑=swim, S/↓=brake, A/D=turn, Shift=burst, B=toggle AI');
+      requestAnimationFrame(manualLoop);
+    }
+  }
+});
+
+document.addEventListener('keyup', function(e) {
+  keysDown[e.key] = false;
+});
 </script>
 {{{ SCRIPT }}}
 </body>
