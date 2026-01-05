@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(emcc:*)",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(pip:*)",
+      "Bash(pip3:*)",
+      "Bash(timeout:*)"
+    ]
+  }
+}

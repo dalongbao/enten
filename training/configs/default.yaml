@@ -1,0 +1,46 @@
+# Digital Goldfish Training Configuration
+
+# Environment
+env:
+  width: 800
+  height: 600
+  max_steps: 1000
+  initial_food: 5
+  food_spawn_rate: 0.02
+
+# Vectorized environment
+num_envs: 64
+
+# Policy network
+policy:
+  num_rays: 16
+  num_lateral: 8
+  hidden_dim: 64
+
+# PPO Hyperparameters
+ppo:
+  learning_rate: 3.0e-4
+  gamma: 0.99           # Discount factor
+  gae_lambda: 0.95      # GAE lambda
+  clip_coef: 0.2        # PPO clip coefficient
+  ent_coef: 0.01        # Entropy coefficient
+  vf_coef: 0.5          # Value function coefficient
+  max_grad_norm: 0.5    # Gradient clipping
+
+# Training
+training:
+  total_timesteps: 1_000_000
+  num_steps: 128        # Steps per rollout
+  num_minibatches: 4    # Minibatches per update
+  update_epochs: 4      # Epochs per update
+  anneal_lr: true       # Anneal learning rate
+
+# Logging
+logging:
+  log_interval: 10      # Log every N updates
+  save_interval: 100    # Save checkpoint every N updates
+
+# Paths
+paths:
+  checkpoint_dir: checkpoints
+  log_dir: logs
