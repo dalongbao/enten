@@ -8,16 +8,242 @@
 * { margin: 0; padding: 0; }
 html, body { width: 100%; height: 100%; overflow: hidden; background: #141e3c; }
 canvas { display: block; position: absolute; top: 0; left: 0; }
+#status {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  color: #fff;
+  font-family: monospace;
+  font-size: 12px;
+  background: rgba(0,0,0,0.5);
+  padding: 5px 10px;
+  border-radius: 4px;
+  pointer-events: none;
+}
 </style>
 </head>
 <body>
 <canvas id="canvas" oncontextmenu="event.preventDefault()"></canvas>
+<div id="status">Loading...</div>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+<script src="renderer.js"></script>
 <script>
+// WebGL renderer
+var renderer = null;
+var foodPosPtr = null;
+var MAX_FOOD = 32;
+
 var Module = {
   canvas: document.getElementById('canvas'),
   print: function(t) { console.log(t); },
-  printErr: function(t) { console.error(t); }
+  printErr: function(t) { console.error(t); },
+  onRuntimeInitialized: function() {
+    initRenderer();
+    initBrain();
+  }
 };
+
+// Initialize WebGL renderer
+function initRenderer() {
+  var canvas = document.getElementById('canvas');
+  renderer = new Renderer(canvas);
+
+  // Allocate buffer for food positions
+  foodPosPtr = Module._malloc(MAX_FOOD * 2 * 4); // 2 floats per food, 4 bytes each
+
+  // Handle initial resize
+  handleResize();
+
+  // Start render loop
+  requestAnimationFrame(renderLoop);
+
+  // Add click handler for dropping food
+  canvas.addEventListener('click', function(e) {
+    Module._drop_food(e.clientX, e.clientY);
+  });
+}
+
+// Handle window resize
+function handleResize() {
+  var w = window.innerWidth;
+  var h = window.innerHeight;
+  renderer.resize(w, h);
+}
+
+window.addEventListener('resize', handleResize);
+
+// Render loop - runs independently from WASM physics loop
+function renderLoop() {
+  if (!renderer) {
+    requestAnimationFrame(renderLoop);
+    return;
+  }
+
+  // Query fish state from WASM
+  var x = Module._get_x();
+  var y = Module._get_y();
+  var angle = Module._get_angle();
+  var tailPhase = Module._get_tail_phase();
+  var tailAmplitude = Module._get_tail_amplitude();
+  var bodyCurve = Module._get_body_curve();
+  var leftPec = Module._get_left_pectoral();
+  var rightPec = Module._get_right_pectoral();
+
+  // Query food from WASM
+  var foodCount = Module._get_food_count();
+  Module._get_food_positions(foodPosPtr);
+
+  // Read food positions from WASM memory
+  var foodPositions = new Float32Array(foodCount * 2);
+  for (var i = 0; i < foodCount * 2; i++) {
+    foodPositions[i] = Module.getValue(foodPosPtr + i * 4, 'float');
+  }
+
+  // Render
+  renderer.clear();
+  renderer.drawFood(foodPositions, foodCount);
+  renderer.drawFish(x, y, angle, tailPhase, tailAmplitude, bodyCurve, leftPec, rightPec);
+
+  requestAnimationFrame(renderLoop);
+}
+
+// Brain state
+var brain = null;
+var brainEnabled = false;
+var obsPtr = null;
+var OBS_SIZE = 52;
+
+// Status display
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+
+// Initialize the neural network brain
+async function initBrain() {
+  setStatus('Initializing...');
+
+  // Allocate memory for observation buffer
+  obsPtr = Module._malloc(OBS_SIZE * 4); // 4 bytes per float
+
+  // Try to load the ONNX model
+  try {
+    // Check if brain.js is available
+    if (typeof FishBrain !== 'undefined') {
+      brain = new FishBrain();
+      await brain.init('model.onnx');
+      brainEnabled = true;
+      setStatus('AI Brain Active - Click to add food');
+      console.log('Brain loaded successfully');
+
+      // Start the brain loop
+      requestAnimationFrame(brainLoop);
+    } else {
+      // No brain.js, try loading ONNX directly
+      const session = await ort.InferenceSession.create('model.onnx');
+      brain = { session: session };
+      brainEnabled = true;
+      setStatus('AI Brain Active - Click to add food');
+      console.log('ONNX model loaded directly');
+
+      requestAnimationFrame(brainLoop);
+    }
+  } catch (e) {
+    console.log('Brain not available:', e.message);
+    setStatus('Manual Mode - Click to add food');
+    brainEnabled = false;
+  }
+}
+
+// Get observation from WASM and run inference
+async function brainLoop() {
+  if (!brainEnabled || !brain) {
+    return;
+  }
+
+  try {
+    // Get observation from WASM
+    Module._get_observation(obsPtr);
+
+    // Read observation floats from WASM memory
+    var obs = new Float32Array(OBS_SIZE);
+    for (var i = 0; i < OBS_SIZE; i++) {
+      obs[i] = Module.getValue(obsPtr + i * 4, 'float');
+    }
+
+    // Run inference
+    var action;
+    if (brain.predict) {
+      // Using FishBrain wrapper
+      action = await brain.predict(obs);
+    } else {
+      // Direct ONNX inference
+      var inputTensor = new ort.Tensor('float32', obs, [1, OBS_SIZE]);
+      var results = await brain.session.run({ observation: inputTensor });
+      var output = results.action.data;
+      action = { tailMag: output[0], bodyCurve: output[1], leftPec: output[2], rightPec: output[3] };
+    }
+
+    // Apply action (4 controls: tail_mag, body_curve, left_pec, right_pec)
+    Module._set_action(action.tailMag, action.bodyCurve, action.leftPec, action.rightPec);
+
+  } catch (e) {
+    console.error('Brain inference error:', e);
+  }
+
+  // Continue loop
+  requestAnimationFrame(brainLoop);
+}
+
+// Manual control state
+var keysDown = {};
+
+// Manual control loop
+function manualLoop() {
+  if (brainEnabled) return;
+
+  // 4 controls: tail_mag, body_curve, left_pec, right_pec
+  var tailMag = keysDown['w'] || keysDown['ArrowUp'] ? 1.0 : 0.3;
+  var bodyCurve = 0;
+  var leftPec = 0;
+  var rightPec = 0;
+
+  // A/Left = turn left (body curves left, right fin pushes)
+  if (keysDown['a'] || keysDown['ArrowLeft']) {
+    bodyCurve = -0.5;
+    rightPec = 0.5;
+  }
+  // D/Right = turn right (body curves right, left fin pushes)
+  if (keysDown['d'] || keysDown['ArrowRight']) {
+    bodyCurve = 0.5;
+    leftPec = 0.5;
+  }
+  // Q/E for individual pectoral fins
+  if (keysDown['q']) leftPec = 1.0;
+  if (keysDown['e']) rightPec = 1.0;
+
+  Module._set_action(tailMag, bodyCurve, leftPec, rightPec);
+  requestAnimationFrame(manualLoop);
+}
+
+// Keyboard controls
+document.addEventListener('keydown', function(e) {
+  keysDown[e.key] = true;
+
+  if (e.key === 'b' || e.key === 'B') {
+    brainEnabled = !brainEnabled;
+    if (brainEnabled && brain) {
+      setStatus('AI Brain Active - Click to add food');
+      requestAnimationFrame(brainLoop);
+    } else {
+      setStatus('Manual: W/↑=swim, A/D or ←/→=turn, B=toggle AI');
+      requestAnimationFrame(manualLoop);
+    }
+  }
+});
+
+document.addEventListener('keyup', function(e) {
+  keysDown[e.key] = false;
+});
 </script>
 {{{ SCRIPT }}}
 </body>

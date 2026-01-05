@@ -5,6 +5,7 @@ src/build/
 *.js
 *.html
 !src/shell.html
+!src/renderer.js
 !inference/brain.js
 
 # Python
