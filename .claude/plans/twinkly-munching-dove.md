@@ -37,16 +37,16 @@
 - [x] **3.2** Create `src/simulator.c` - environment state and logic (depends: 3.1)
 - [x] **3.3** Create `src/renderer.c` - extract SDL2 rendering from main.c (depends: 3.1)
 - [x] **3.4** Update `src/main.c` - entry point only, use new modules (depends: 3.1, 3.2, 3.3)
-- [ ] **3.5** Update `src/Makefile` - build new file structure (depends: 3.4)
+- [x] **3.5** Update `src/Makefile` - build new file structure (depends: 3.4)
 
 ### Phase 4: Training & Validation
 - [ ] **4.1** Run initial training, tune hyperparameters (depends: 2.3)
 - [ ] **4.2** Validate physics match between Python and C (depends: 3.4, 4.1)
 
 ### Phase 5: Browser Integration (LATER)
-- [ ] **5.1** Create `training/models/export.py` - ONNX export utility (depends: 4.1)
-- [ ] **5.2** Create `inference/brain.js` - ONNX.js inference wrapper (depends: 5.1)
-- [ ] **5.3** Update `src/shell.html` - integrate brain.js (depends: 5.2)
+- [x] **5.1** Create `training/models/export.py` - ONNX export utility (depends: 4.1)
+- [x] **5.2** Create `inference/brain.js` - ONNX.js inference wrapper (depends: 5.1)
+- [x] **5.3** Update `src/shell.html` - integrate brain.js (depends: 5.2)
 
 ---
 
