@@ -1,0 +1,28 @@
+{
+  "spine": {
+    "jointCount": 4,
+    "segmentRatios": [28, 18, 18],
+    "baseLength": 12,
+    "angleConstraint": 0.52,
+    "flapSpeed": 6,
+    "flapAmplitude": 0.35,
+    "bodyJoints": 4
+  },
+  "body": {
+    "widthProfile": [24, 40, 40, 6],
+    "maxWidth": 40
+  },
+  "tail": {
+    "rays": 7,
+    "segments": 10,
+    "segmentLength": 16,
+    "spread": 1.2,
+    "stiffness": 400,
+    "damping": 10
+  },
+  "colors": {
+    "body": "#ff9933",
+    "fin": "rgba(255, 140, 60, 0.7)",
+    "outline": "#cc6600"
+  }
+}

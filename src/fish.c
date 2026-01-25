@@ -323,8 +323,8 @@ void fish_compute_body(Fish *fish) {
 
       // Rigidity ramps quadratically, extra rigid at base
       float rigidity = t * t;
-      if (j < 2)
-        rigidity *= 0.3f;
+      // if (j < 2)
+      //   rigidity *= 0.1f;
 
       float dist = t * ray_len;
       float wave_phase = s->tail.phase - t * 2.0f - ray_phase_offset;
@@ -495,7 +495,8 @@ void fish_emit_particles(Fish *fish, float dt) {
 
   // Emission rate based on tail activity and speed
   float speed = sqrtf(s->vel.x * s->vel.x + s->vel.y * s->vel.y);
-  float emit_rate = s->tail.amplitude * s->tail.frequency * 20.0f + speed * 0.1f;
+  float emit_rate =
+      s->tail.amplitude * s->tail.frequency * 20.0f + speed * 0.1f;
   if (emit_rate < 0.5f)
     emit_rate = 0.5f;
 

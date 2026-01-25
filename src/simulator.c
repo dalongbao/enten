@@ -62,35 +62,16 @@ void sim_step(Simulation* sim, const float actions[][3], int* eaten_out) {
         sim->fish[i].state.vel.y += sep_y * sim->dt;
     }
 
+    // Screen wrapping (infinite canvas)
     for (int i = 0; i < sim->fish_count; i++) {
-        float x = sim->fish[i].state.pos.x;
-        float y = sim->fish[i].state.pos.y;
-        float bx = 0.0f, by = 0.0f;
-
-        if (x < BOUNDARY_MARGIN) {
-            float strength = (BOUNDARY_MARGIN - x) / BOUNDARY_MARGIN;
-            bx += strength * BOUNDARY_FORCE;
-        }
-        if (x > sim->screen_width - BOUNDARY_MARGIN) {
-            float strength = (x - (sim->screen_width - BOUNDARY_MARGIN)) / BOUNDARY_MARGIN;
-            bx -= strength * BOUNDARY_FORCE;
-        }
-        if (y < BOUNDARY_MARGIN) {
-            float strength = (BOUNDARY_MARGIN - y) / BOUNDARY_MARGIN;
-            by += strength * BOUNDARY_FORCE;
-        }
-        if (y > sim->screen_height - BOUNDARY_MARGIN) {
-            float strength = (y - (sim->screen_height - BOUNDARY_MARGIN)) / BOUNDARY_MARGIN;
-            by -= strength * BOUNDARY_FORCE;
-        }
-
-        sim->fish[i].state.vel.x += bx * sim->dt;
-        sim->fish[i].state.vel.y += by * sim->dt;
-
-        if (sim->fish[i].state.pos.x < 0) sim->fish[i].state.pos.x = 0;
-        if (sim->fish[i].state.pos.x >= sim->screen_width) sim->fish[i].state.pos.x = sim->screen_width - 1;
-        if (sim->fish[i].state.pos.y < 0) sim->fish[i].state.pos.y = 0;
-        if (sim->fish[i].state.pos.y >= sim->screen_height) sim->fish[i].state.pos.y = sim->screen_height - 1;
+        if (sim->fish[i].state.pos.x < 0)
+            sim->fish[i].state.pos.x += sim->screen_width;
+        if (sim->fish[i].state.pos.x >= sim->screen_width)
+            sim->fish[i].state.pos.x -= sim->screen_width;
+        if (sim->fish[i].state.pos.y < 0)
+            sim->fish[i].state.pos.y += sim->screen_height;
+        if (sim->fish[i].state.pos.y >= sim->screen_height)
+            sim->fish[i].state.pos.y -= sim->screen_height;
     }
 
     for (int i = 0; i < sim->food_count; i++) {

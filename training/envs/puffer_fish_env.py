@@ -1,33 +1,4 @@
-"""
-PufferLib-style multi-fish environment for RL training.
-
-This environment follows PufferLib API conventions (4-value step returns)
-and provides native vectorization across multiple environments, each
-containing multiple fish. Works standalone or with PufferLib training.
-
-Features:
-- N fish (default 3) swimming in the same environment
-- Independent physics and control per fish
-- Shared food system (fish compete for food)
-- Social dynamics (schooling rewards based on proximity)
-
-Observation per fish (60 features):
-- Raycasts: 32 (16 rays x 2 values)
-- Lateral line: 16 (8 sensors x 2 values)
-- Proprioception: 4 (vel_forward, vel_lateral, angular_vel, speed)
-- Internal: 4 (hunger, stress, social_comfort, energy)
-- Social: 4 (nearest_dist, nearest_angle, num_nearby, heading_diff)
-
-Action space (3 per fish):
-- speed [0, 1]: Desired forward speed
-- direction [-1, 1]: Turn rate
-- urgency [0, 1]: Movement intensity
-
-Key differences from VecFishEnv:
-- Returns (obs, rewards, dones, infos) instead of Gymnasium's 5-value tuple
-- Observations/actions are per-agent (num_envs * num_fish, dim) not per-env
-- Built-in episode statistics tracking
-"""
+"""PufferLib-style vectorized multi-fish environment (per-agent API)."""
 
 import numpy as np
 from gymnasium import spaces
@@ -36,68 +7,62 @@ from gymnasium import spaces
 class PufferFishEnv:
     """PufferLib-native vectorized multi-fish environment."""
 
-    # Perception constants
     NUM_RAYS = 16
-    RAY_ARC = np.pi  # 180 degrees
-    MAX_RAY_LENGTH = 200.0
+    RAY_ARC = np.pi * 1.5  # 270 degrees
+    MAX_RAY_LENGTH = 450.0
     NUM_LATERAL_SENSORS = 8
-    OBS_DIM = NUM_RAYS * 2 + NUM_LATERAL_SENSORS * 2 + 4 + 4 + 4  # 60
+    OBS_DIM = NUM_RAYS * 2 + NUM_LATERAL_SENSORS * 2 + 4 + 4 + 4
 
-    # Tail frequency range
-    TAIL_FREQ_MIN = 0.3
-    TAIL_FREQ_MAX = 0.5
+    # Fin-based physics constants
+    FIN_BODY_FREQ_MIN = 0.5
+    FIN_BODY_FREQ_MAX = 4.0
+    FIN_PEC_FREQ_MIN = 0.0
+    FIN_PEC_FREQ_MAX = 3.0
+    FIN_PEC_LEVER_ARM = 30.0
 
     def __init__(self, num_envs: int = 64, num_fish: int = 3, config: dict = None):
         self.num_envs = num_envs
         self.num_fish = num_fish
         self.config = config or {}
 
-        # Environment dimensions
         self.width = self.config.get("width", 800)
         self.height = self.config.get("height", 600)
 
-        # Single agent observation/action dims
         self.single_obs_dim = self.OBS_DIM
-        self.single_action_dim = 3
+        self.single_action_dim = 6
 
-        # PufferLib requires these spaces (per single observation/action)
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.single_obs_dim,), dtype=np.float32
         )
+        # 6 actions: body_freq, body_amp, left_pec_freq, left_pec_amp, right_pec_freq, right_pec_amp
         self.action_space = spaces.Box(
-            low=np.array([0.0, -1.0, 0.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, 1.0], dtype=np.float32),
+            low=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            high=np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
             dtype=np.float32,
         )
 
-        # Goldfish variety
         variety = self.config.get("variety", "common")
         self._set_variety(variety)
 
-        # Food parameters
-        self.max_food = 32
+        self.max_food = self.config.get("max_food", 128)
         self.eat_radius = 40.0
         self.food_aoe_base = 30.0
         self.food_aoe_growth = 5.0
 
-        # Episode settings
         self.max_steps = self.config.get("max_steps", 2000)
         self.dt = 1.0 / 60.0
 
-        # Internal state parameters
         self.energy_cost_base = 0.0001
         self.energy_recovery_rate = 0.0005
-        self.hunger_decay_rate = 0.001
+        self.hunger_decay_rate = 0.01
         self.hunger_eat_restore = 0.3
         self.stress_decay_rate = 0.1
 
-        # Exploration parameters
         exploration_config = self.config.get("exploration", {})
         self.grid_size = exploration_config.get("grid_size", 100)
         self.visit_bonus = exploration_config.get("visit_bonus", 0.05)
         self.distance_bonus = exploration_config.get("distance_bonus", 0.001)
 
-        # Social/schooling parameters
         self.schooling_min_dist = 50.0
         self.schooling_max_dist = 150.0
         self.collision_dist = 30.0
@@ -105,11 +70,9 @@ class PufferFishEnv:
         self.separation_penalty = 0.05
         self.alignment_reward = 0.005
 
-        # Pre-compute ray angles
         t = np.linspace(0, 1, self.NUM_RAYS)
         self.ray_angles_rel = (t - 0.5) * self.RAY_ARC
 
-        # Lateral sensor offsets
         self.lateral_along = np.array([
             (i % 4 - 1.5) / 3.0 * 0.8 * self.body_length
             for i in range(self.NUM_LATERAL_SENSORS)
@@ -119,10 +82,7 @@ class PufferFishEnv:
         ])
         self.lateral_perp_dist = self.body_length / 4
 
-        # RNG
         self.rng = np.random.default_rng()
-
-        # Initialize state arrays
         self._init_state_arrays()
 
     def _set_variety(self, variety: str):
@@ -150,11 +110,9 @@ class PufferFishEnv:
             self.mass = 1.0
 
     def _init_state_arrays(self):
-        """Initialize all state arrays."""
         n = self.num_envs
         m = self.num_fish
 
-        # Fish state: (num_envs, num_fish, ...)
         self.pos = np.zeros((n, m, 2), dtype=np.float32)
         self.vel = np.zeros((n, m, 2), dtype=np.float32)
         self.angle = np.zeros((n, m), dtype=np.float32)
@@ -165,23 +123,19 @@ class PufferFishEnv:
         self.left_pectoral = np.zeros((n, m), dtype=np.float32)
         self.right_pectoral = np.zeros((n, m), dtype=np.float32)
 
-        # Food: (num_envs, max_food, 3)
         self.food = np.zeros((n, self.max_food, 3), dtype=np.float32)
         self.food_count = np.zeros(n, dtype=np.int32)
 
         self.steps = np.zeros(n, dtype=np.int32)
 
-        # Internal state per fish
         self.hunger = np.ones((n, m), dtype=np.float32) * 0.6
         self.stress = np.zeros((n, m), dtype=np.float32)
         self.social_comfort = np.ones((n, m), dtype=np.float32) * 0.5
         self.energy = np.ones((n, m), dtype=np.float32)
 
-        # Exploration state
         self.visited_cells = [[set() for _ in range(m)] for _ in range(n)]
         self.prev_pos = np.zeros((n, m, 2), dtype=np.float32)
 
-        # Episode tracking for each agent (env * fish)
         self.episode_returns = np.zeros((n, m), dtype=np.float32)
         self.episode_lengths = np.zeros((n, m), dtype=np.int32)
 
@@ -193,7 +147,6 @@ class PufferFishEnv:
         n = self.num_envs
         m = self.num_fish
 
-        # Initialize fish positions
         self.pos = np.zeros((n, m, 2), dtype=np.float32)
         for env_idx in range(n):
             for fish_idx in range(m):
@@ -222,25 +175,19 @@ class PufferFishEnv:
         self.food_count = np.zeros(n, dtype=np.int32)
         self.steps = np.zeros(n, dtype=np.int32)
 
-        # Spawn initial food
-        initial_food = self.config.get("initial_food", 8)
-        self._spawn_food_all(initial_food)
+        self._spawn_food_all(self._get_initial_food())
 
-        # Reset internal state
         self.hunger = np.ones((n, m), dtype=np.float32) * 0.6
         self.stress = np.zeros((n, m), dtype=np.float32)
         self.social_comfort = np.ones((n, m), dtype=np.float32) * 0.5
         self.energy = np.ones((n, m), dtype=np.float32)
 
-        # Reset exploration
         self.visited_cells = [[set() for _ in range(m)] for _ in range(n)]
         self.prev_pos = self.pos.copy()
 
-        # Reset episode tracking
         self.episode_returns = np.zeros((n, m), dtype=np.float32)
         self.episode_lengths = np.zeros((n, m), dtype=np.int32)
 
-        # Return observations: (num_envs * num_fish, obs_dim)
         return self._get_obs()
 
     def step(self, actions):
@@ -259,30 +206,27 @@ class PufferFishEnv:
         n = self.num_envs
         m = self.num_fish
 
-        # Reshape actions: (n * m, 3) -> (n, m, 3)
-        actions = np.asarray(actions, dtype=np.float32).reshape(n, m, 3)
+        actions = np.asarray(actions, dtype=np.float32).reshape(n, m, 6)
 
-        speed = np.clip(actions[:, :, 0], 0.0, 1.0)
-        direction = np.clip(actions[:, :, 1], -1.0, 1.0)
-        urgency = np.clip(actions[:, :, 2], 0.0, 1.0)
+        body_freq = np.clip(actions[:, :, 0], 0.0, 1.0)
+        body_amp = np.clip(actions[:, :, 1], 0.0, 1.0)
+        left_pec_freq = np.clip(actions[:, :, 2], 0.0, 1.0)
+        left_pec_amp = np.clip(actions[:, :, 3], 0.0, 1.0)
+        right_pec_freq = np.clip(actions[:, :, 4], 0.0, 1.0)
+        right_pec_amp = np.clip(actions[:, :, 5], 0.0, 1.0)
 
-        # Physics update
-        self._physics_step(speed, direction, urgency)
+        self._physics_step_fin(body_freq, body_amp, left_pec_freq, left_pec_amp, right_pec_freq, right_pec_amp)
 
-        # Age food
         for i in range(n):
             if self.food_count[i] > 0:
                 self.food[i, :self.food_count[i], 2] += self.dt
 
-        # Check eating
         food_eaten = self._check_eating()
 
-        # Compute rewards per fish: (n, m)
         rewards = self._compute_equilibrium_reward(food_eaten)
         rewards += self._compute_social_reward()
         rewards += self._compute_exploration_reward()
 
-        # Spawn new food
         spawn_rate = self.config.get("food_spawn_rate", 0.02)
         spawn_mask = self.rng.random(n) < spawn_rate
         for i in np.where(spawn_mask)[0]:
@@ -290,33 +234,26 @@ class PufferFishEnv:
 
         self.steps += 1
 
-        # Track episode stats
         self.episode_returns += rewards
         self.episode_lengths += 1
 
-        # Check truncation (per env, applied to all fish in that env)
-        env_truncated = self.steps >= self.max_steps  # (n,)
-        env_terminated = np.zeros(n, dtype=bool)  # No terminal states
+        env_truncated = self.steps >= self.max_steps
+        env_terminated = np.zeros(n, dtype=bool)
         env_done = env_truncated | env_terminated
 
-        # Expand to per-fish: (n, m)
         fish_dones = np.broadcast_to(env_done[:, None], (n, m))
 
-        # Prepare info with episode stats for done agents
         infos = {}
         if env_done.any():
             done_returns = self.episode_returns[env_done].flatten()
             done_lengths = self.episode_lengths[env_done].flatten()
             infos["episode_return"] = done_returns
             infos["episode_length"] = done_lengths
-
-            # Auto-reset done environments
             self._reset_envs(env_done)
 
-        # Flatten outputs for PufferLib: (n * m, ...)
-        obs = self._get_obs()  # (n * m, obs_dim)
-        rewards_flat = rewards.flatten()  # (n * m,)
-        dones_flat = fish_dones.flatten()  # (n * m,)
+        obs = self._get_obs()
+        rewards_flat = rewards.flatten()
+        dones_flat = fish_dones.flatten()
 
         return obs, rewards_flat, dones_flat, infos
 
@@ -329,7 +266,6 @@ class PufferFishEnv:
 
         m = self.num_fish
 
-        # Reset fish positions
         for env_idx in indices:
             for fish_idx in range(m):
                 while True:
@@ -356,84 +292,111 @@ class PufferFishEnv:
         self.food_count[indices] = 0
         self.steps[indices] = 0
 
-        # Spawn initial food
-        initial_food = self.config.get("initial_food", 8)
         for idx in indices:
-            self._spawn_food_single(idx, initial_food)
+            self._spawn_food_single(idx, self._get_initial_food())
 
-        # Reset internal state
         self.hunger[indices] = 0.6
         self.stress[indices] = 0.0
         self.social_comfort[indices] = 0.5
         self.energy[indices] = 1.0
 
-        # Reset exploration
         for idx in indices:
             self.visited_cells[idx] = [set() for _ in range(m)]
         self.prev_pos[indices] = self.pos[indices].copy()
 
-        # Reset episode tracking
         self.episode_returns[indices] = 0.0
         self.episode_lengths[indices] = 0
 
-    def _physics_step(self, speed, direction, urgency):
-        """Vectorized physics update."""
-        # Tail animation
-        tail_freq = self.TAIL_FREQ_MIN + urgency * (self.TAIL_FREQ_MAX - self.TAIL_FREQ_MIN)
-        self.tail_phase += tail_freq * 2.0 * np.pi * self.dt
+    def _physics_step_fin(self, body_freq, body_amp, left_pec_freq, left_pec_amp, right_pec_freq, right_pec_amp):
+        """Fin-based physics: direct fin control drives movement."""
+        # Map normalized actions to physical parameters
+        actual_body_freq = self.FIN_BODY_FREQ_MIN + body_freq * (self.FIN_BODY_FREQ_MAX - self.FIN_BODY_FREQ_MIN)
+        actual_body_amp = body_amp
+
+        # === TAIL ANIMATION ===
+        self.tail_phase += actual_body_freq * 2.0 * np.pi * self.dt
         self.tail_phase = self.tail_phase % (2.0 * np.pi)
 
-        # Body curve
-        target_curve = direction * 0.4
-        self.body_curve += (target_curve - self.body_curve) * 5.0 * self.dt
+        # === THRUST FROM TAIL ===
+        fin_area = self.body_length * self.fin_area_mult * 0.1
+        thrust = self.thrust_coeff * actual_body_amp * actual_body_freq * fin_area
 
-        # Pectoral fins
-        base_pec = 0.3 - speed * 0.2
-        self.left_pectoral = base_pec + direction * 0.3
-        self.right_pectoral = base_pec - direction * 0.3
-
-        # Rotation
-        effective_turn_rate = self.turn_rate * (0.5 + urgency * 0.5)
-        self.angular_vel = direction * effective_turn_rate
-        self.angle += self.angular_vel * self.dt
-
-        # Thrust
+        # Modulate by tail phase (peak thrust at mid-stroke)
         tail_pulse = np.sin(self.tail_phase) ** 2
-        thrust_factor = 0.3 + urgency * 0.7
-        thrust = speed * self.thrust_coeff * self.fin_area_mult * thrust_factor
         thrust *= (0.5 + tail_pulse * 0.5)
 
+        # === TORQUE FROM PECTORAL FINS ===
+        left_pec_actual_freq = self.FIN_PEC_FREQ_MIN + left_pec_freq * (self.FIN_PEC_FREQ_MAX - self.FIN_PEC_FREQ_MIN)
+        right_pec_actual_freq = self.FIN_PEC_FREQ_MIN + right_pec_freq * (self.FIN_PEC_FREQ_MAX - self.FIN_PEC_FREQ_MIN)
+
+        left_force = left_pec_amp * left_pec_actual_freq
+        right_force = right_pec_amp * right_pec_actual_freq
+        torque = (right_force - left_force) * self.FIN_PEC_LEVER_ARM
+
+        # Update angular velocity from torque
+        self.angular_vel += torque / self.mass * self.dt
+
+        # Angular drag to prevent spinning forever
+        angular_drag = 0.95
+        self.angular_vel *= np.power(angular_drag, self.dt * 60.0)
+
+        # Update angle
+        self.angle += self.angular_vel * self.dt
+
+        # === BODY CURVE (based on turning) ===
+        target_curve = self.angular_vel * 0.3
+        self.body_curve += (target_curve - self.body_curve) * 5.0 * self.dt
+
+        # Update pectoral fin display values
+        self.left_pectoral = left_pec_amp
+        self.right_pectoral = right_pec_amp
+
+        # === VELOCITY UPDATE ===
+        cos_a = np.cos(self.angle)
+        sin_a = np.sin(self.angle)
+
+        # Thrust in facing direction (adjusted by body curve)
         thrust_angle = self.angle - self.body_curve * 0.2
         cos_thrust = np.cos(thrust_angle)
         sin_thrust = np.sin(thrust_angle)
         fx = thrust * cos_thrust
         fy = thrust * sin_thrust
 
-        # Drag
+        # Current speed for drag calculation
         self.current_speed = np.linalg.norm(self.vel, axis=2)
-        effective_drag = self.drag_coeff * self.fin_area_mult + np.abs(self.body_curve) * 2.0
 
-        drag_mask = self.current_speed > 0.0001
-        drag_force = np.zeros_like(self.current_speed)
-        drag_force[drag_mask] = effective_drag[drag_mask] * self.current_speed[drag_mask]
+        # Decompose velocity into forward/lateral components
+        v_forward = self.vel[:, :, 0] * cos_a + self.vel[:, :, 1] * sin_a
+        v_lateral = -self.vel[:, :, 0] * sin_a + self.vel[:, :, 1] * cos_a
 
-        vel_norm = np.zeros_like(self.vel)
-        vel_norm[drag_mask] = self.vel[drag_mask] / self.current_speed[drag_mask, np.newaxis]
-        fx -= drag_force * vel_norm[:, :, 0]
-        fy -= drag_force * vel_norm[:, :, 1]
+        # Drag model (lateral drag much higher than forward)
+        base_drag = self.drag_coeff * self.fin_area_mult * 0.01
+        lateral_mult = 10.0
+        curve_drag = np.abs(self.body_curve) * 0.5
+
+        drag_forward = (base_drag + curve_drag) * v_forward * np.abs(v_forward)
+        drag_lateral = (base_drag * lateral_mult) * v_lateral * np.abs(v_lateral)
+
+        drag_x = drag_forward * cos_a - drag_lateral * sin_a
+        drag_y = drag_forward * sin_a + drag_lateral * cos_a
+
+        fx -= drag_x
+        fy -= drag_y
 
         # Integration
-        ax = fx / self.mass
-        ay = fy / self.mass
+        effective_mass = self.mass * 1.3
+        ax = fx / effective_mass
+        ay = fy / effective_mass
         self.vel[:, :, 0] += ax * self.dt
         self.vel[:, :, 1] += ay * self.dt
         self.pos[:, :, 0] += self.vel[:, :, 0] * self.dt
         self.pos[:, :, 1] += self.vel[:, :, 1] * self.dt
 
-        # Internal state
-        movement_intensity = speed * (0.3 + urgency * 0.7)
+        # === INTERNAL STATE UPDATES ===
+        # Energy cost based on fin activity
+        movement_intensity = body_amp * body_freq + (left_pec_amp * left_pec_freq + right_pec_amp * right_pec_freq) * 0.5
         self.energy -= self.energy_cost_base * movement_intensity
-        self.energy += self.energy_recovery_rate * (1.0 - speed) * self.dt
+        self.energy += self.energy_recovery_rate * (1.0 - movement_intensity) * self.dt
         self.energy = np.clip(self.energy, 0.0, 1.0)
 
         self.hunger -= self.hunger_decay_rate * self.dt
@@ -441,28 +404,34 @@ class PufferFishEnv:
 
         self.stress *= (1.0 - self.stress_decay_rate * self.dt)
 
-        # Wraparound
+        # Collision avoidance between fish (vectorized)
+        collision_radius = 100.0
+        separation_force = 300.0
+        n, m = self.num_envs, self.num_fish
+        pos_i = self.pos[:, :, np.newaxis, :]  # (n, m, 1, 2)
+        pos_j = self.pos[:, np.newaxis, :, :]  # (n, 1, m, 2)
+        diff = pos_i - pos_j  # (n, m, m, 2)
+        dist = np.linalg.norm(diff, axis=3)  # (n, m, m)
+        dist = np.where(dist < 0.1, 1e6, dist)  # avoid div by zero, ignore self
+        mask = (dist < collision_radius) & (dist < 1e5)
+        strength = np.where(mask, ((collision_radius - dist) / collision_radius) ** 2, 0)
+        sep = (diff / dist[:, :, :, np.newaxis]) * strength[:, :, :, np.newaxis] * separation_force
+        sep = np.sum(sep, axis=2)  # (n, m, 2)
+        self.vel += sep * self.dt
+
+        # Screen wrapping (infinite canvas)
         self.pos[:, :, 0] = self.pos[:, :, 0] % self.width
         self.pos[:, :, 1] = self.pos[:, :, 1] % self.height
 
     def _get_obs(self):
-        """Get observations for all agents. Returns (num_envs * num_fish, obs_dim)."""
         n = self.num_envs
         m = self.num_fish
         obs = np.zeros((n, m, self.OBS_DIM), dtype=np.float32)
 
-        for env_idx in range(n):
-            for fish_idx in range(m):
-                # Raycasts
-                ray_obs = self._cast_rays_single(env_idx, fish_idx)
-                obs[env_idx, fish_idx, :self.NUM_RAYS * 2] = ray_obs
+        obs[:, :, :self.NUM_RAYS * 2] = self._cast_rays_batch()
+        lateral_start = self.NUM_RAYS * 2
+        obs[:, :, lateral_start:lateral_start + self.NUM_LATERAL_SENSORS * 2] = self._sense_lateral_batch()
 
-                # Lateral line
-                lateral_start = self.NUM_RAYS * 2
-                lateral_obs = self._sense_lateral_single(env_idx, fish_idx)
-                obs[env_idx, fish_idx, lateral_start:lateral_start + self.NUM_LATERAL_SENSORS * 2] = lateral_obs
-
-        # Proprioception (vectorized)
         proprio_start = self.NUM_RAYS * 2 + self.NUM_LATERAL_SENSORS * 2
         cos_angle = np.cos(self.angle)
         sin_angle = np.sin(self.angle)
@@ -479,177 +448,208 @@ class PufferFishEnv:
         obs[:, :, proprio_start + 2] = np.clip(angular_vel_norm, -1, 1)
         obs[:, :, proprio_start + 3] = np.clip(speed_norm, -1, 1)
 
-        # Internal state
         internal_start = proprio_start + 4
         obs[:, :, internal_start] = self.hunger
         obs[:, :, internal_start + 1] = self.stress
         obs[:, :, internal_start + 2] = self.social_comfort
         obs[:, :, internal_start + 3] = self.energy
 
-        # Social features
         social_start = internal_start + 4
         social_obs = self._compute_social_obs()
         obs[:, :, social_start:social_start + 4] = social_obs
 
-        # Flatten to (n * m, obs_dim)
         return obs.reshape(n * m, self.OBS_DIM)
 
     def _compute_social_obs(self):
-        """Compute social observation features for all fish."""
-        n = self.num_envs
-        m = self.num_fish
+        n, m = self.num_envs, self.num_fish
         social = np.zeros((n, m, 4), dtype=np.float32)
 
         if m == 1:
             social[:, :, 0] = 1.0
             return social
 
-        for env_idx in range(n):
-            for fish_idx in range(m):
-                my_pos = self.pos[env_idx, fish_idx]
-                my_angle = self.angle[env_idx, fish_idx]
-                my_heading = np.array([np.cos(my_angle), np.sin(my_angle)])
+        pos_i = self.pos[:, :, np.newaxis, :]  # (n, m, 1, 2)
+        pos_j = self.pos[:, np.newaxis, :, :]  # (n, 1, m, 2)
+        diff = pos_j - pos_i  # (n, m, m, 2)
 
-                dists = []
-                angles_to_others = []
+        diff[:, :, :, 0] = np.where(diff[:, :, :, 0] > self.width/2, diff[:, :, :, 0] - self.width, diff[:, :, :, 0])
+        diff[:, :, :, 0] = np.where(diff[:, :, :, 0] < -self.width/2, diff[:, :, :, 0] + self.width, diff[:, :, :, 0])
+        diff[:, :, :, 1] = np.where(diff[:, :, :, 1] > self.height/2, diff[:, :, :, 1] - self.height, diff[:, :, :, 1])
+        diff[:, :, :, 1] = np.where(diff[:, :, :, 1] < -self.height/2, diff[:, :, :, 1] + self.height, diff[:, :, :, 1])
 
-                for other_idx in range(m):
-                    if other_idx == fish_idx:
-                        continue
+        dists = np.linalg.norm(diff, axis=3)  # (n, m, m)
+        eye_mask = np.eye(m, dtype=bool)[np.newaxis, :, :]
+        dists = np.where(eye_mask, 1e6, dists)
 
-                    diff = self.pos[env_idx, other_idx] - my_pos
-                    # Wraparound
-                    if diff[0] > self.width / 2:
-                        diff[0] -= self.width
-                    elif diff[0] < -self.width / 2:
-                        diff[0] += self.width
-                    if diff[1] > self.height / 2:
-                        diff[1] -= self.height
-                    elif diff[1] < -self.height / 2:
-                        diff[1] += self.height
+        nearest_idx = np.argmin(dists, axis=2)  # (n, m)
+        nearest_dist = np.take_along_axis(dists, nearest_idx[:, :, np.newaxis], axis=2).squeeze(-1)
+        social[:, :, 0] = np.clip(nearest_dist / self.schooling_max_dist, 0.0, 1.0)
 
-                    dist = np.linalg.norm(diff)
-                    dists.append(dist)
+        angles_to = np.arctan2(diff[:, :, :, 1], diff[:, :, :, 0]) - self.angle[:, :, np.newaxis]
+        angles_to = (angles_to + np.pi) % (2 * np.pi) - np.pi
+        nearest_angle = np.take_along_axis(angles_to, nearest_idx[:, :, np.newaxis], axis=2).squeeze(-1)
+        social[:, :, 1] = nearest_angle / np.pi
 
-                    if dist > 0.1:
-                        angle_to_other = np.arctan2(diff[1], diff[0]) - my_angle
-                        while angle_to_other > np.pi:
-                            angle_to_other -= 2 * np.pi
-                        while angle_to_other < -np.pi:
-                            angle_to_other += 2 * np.pi
-                    else:
-                        angle_to_other = 0.0
-                    angles_to_others.append(angle_to_other)
+        nearby = (dists < self.schooling_max_dist) & ~eye_mask
+        social[:, :, 2] = np.sum(nearby, axis=2) / (m - 1)
 
-                dists = np.array(dists)
-                angles_to_others = np.array(angles_to_others)
-
-                nearest_idx = np.argmin(dists)
-                nearest_dist = dists[nearest_idx]
-                social[env_idx, fish_idx, 0] = np.clip(nearest_dist / self.schooling_max_dist, 0.0, 1.0)
-                social[env_idx, fish_idx, 1] = angles_to_others[nearest_idx] / np.pi
-
-                num_nearby = np.sum(dists < self.schooling_max_dist)
-                social[env_idx, fish_idx, 2] = num_nearby / (m - 1)
-
-                heading_diffs = []
-                other_indices = [j for j in range(m) if j != fish_idx]
-                for j_idx, j in enumerate(other_indices):
-                    if dists[j_idx] < self.schooling_max_dist:
-                        other_heading = np.array([
-                            np.cos(self.angle[env_idx, j]),
-                            np.sin(self.angle[env_idx, j])
-                        ])
-                        heading_diffs.append(np.dot(my_heading, other_heading))
-
-                if heading_diffs:
-                    social[env_idx, fish_idx, 3] = np.mean(heading_diffs)
+        cos_a, sin_a = np.cos(self.angle), np.sin(self.angle)
+        heading = np.stack([cos_a, sin_a], axis=-1)  # (n, m, 2)
+        heading_i = heading[:, :, np.newaxis, :]
+        heading_j = heading[:, np.newaxis, :, :]
+        heading_dot = np.sum(heading_i * heading_j, axis=3)  # (n, m, m)
+        heading_dot = np.where(nearby, heading_dot, 0)
+        nearby_count = np.sum(nearby, axis=2, keepdims=True).clip(1, None)
+        social[:, :, 3] = np.sum(heading_dot, axis=2) / nearby_count.squeeze(-1)
 
         return social
 
     def _compute_social_reward(self):
-        """Compute schooling/social rewards."""
-        n = self.num_envs
-        m = self.num_fish
+        n, m = self.num_envs, self.num_fish
         rewards = np.zeros((n, m), dtype=np.float32)
 
         if m == 1:
             return rewards
 
-        for env_idx in range(n):
-            for fish_idx in range(m):
-                stress = self.stress[env_idx, fish_idx]
-                min_dist = 30 + (1 - stress) * 20
-                max_dist = 100 + (1 - stress) * 100
+        pos_i = self.pos[:, :, np.newaxis, :]
+        pos_j = self.pos[:, np.newaxis, :, :]
+        diff = pos_j - pos_i
 
-                dists = []
-                for other_idx in range(m):
-                    if other_idx == fish_idx:
-                        continue
-                    diff = self.pos[env_idx, other_idx] - self.pos[env_idx, fish_idx]
-                    if diff[0] > self.width / 2:
-                        diff[0] -= self.width
-                    elif diff[0] < -self.width / 2:
-                        diff[0] += self.width
-                    if diff[1] > self.height / 2:
-                        diff[1] -= self.height
-                    elif diff[1] < -self.height / 2:
-                        diff[1] += self.height
-                    dists.append(np.linalg.norm(diff))
+        diff[:, :, :, 0] = np.where(diff[:, :, :, 0] > self.width/2, diff[:, :, :, 0] - self.width, diff[:, :, :, 0])
+        diff[:, :, :, 0] = np.where(diff[:, :, :, 0] < -self.width/2, diff[:, :, :, 0] + self.width, diff[:, :, :, 0])
+        diff[:, :, :, 1] = np.where(diff[:, :, :, 1] > self.height/2, diff[:, :, :, 1] - self.height, diff[:, :, :, 1])
+        diff[:, :, :, 1] = np.where(diff[:, :, :, 1] < -self.height/2, diff[:, :, :, 1] + self.height, diff[:, :, :, 1])
 
-                nearest_dist = min(dists)
+        dists = np.linalg.norm(diff, axis=3)
+        eye_mask = np.eye(m, dtype=bool)[np.newaxis, :, :]
+        dists = np.where(eye_mask, 1e6, dists)
 
-                if nearest_dist < self.collision_dist:
-                    rewards[env_idx, fish_idx] -= self.separation_penalty
-                elif nearest_dist < min_dist:
-                    rewards[env_idx, fish_idx] -= 0.02 * (min_dist - nearest_dist) / min_dist
-                elif min_dist <= nearest_dist <= max_dist:
-                    zone_center = (min_dist + max_dist) / 2
-                    distance_from_center = abs(nearest_dist - zone_center)
-                    zone_half_width = (max_dist - min_dist) / 2
-                    rewards[env_idx, fish_idx] += self.cohesion_reward * (1 - distance_from_center / zone_half_width)
+        nearest_dist = np.min(dists, axis=2)
+        nearest_idx = np.argmin(dists, axis=2)
 
-                # Alignment reward
-                nearest_idx = dists.index(nearest_dist)
-                other_indices = [j for j in range(m) if j != fish_idx]
-                nearest_fish = other_indices[nearest_idx]
-                my_heading = np.array([
-                    np.cos(self.angle[env_idx, fish_idx]),
-                    np.sin(self.angle[env_idx, fish_idx])
-                ])
-                other_heading = np.array([
-                    np.cos(self.angle[env_idx, nearest_fish]),
-                    np.sin(self.angle[env_idx, nearest_fish])
-                ])
-                heading_dot = np.dot(my_heading, other_heading)
-                if heading_dot > 0.7:
-                    rewards[env_idx, fish_idx] += self.alignment_reward * (heading_dot - 0.7) / 0.3
+        min_d = 30 + (1 - self.stress) * 20
+        max_d = 100 + (1 - self.stress) * 100
 
-                # Update social comfort
-                in_comfort_zone = sum(1 for d in dists if min_dist < d < max_dist)
-                too_close = sum(1 for d in dists if d < self.collision_dist)
+        collision = nearest_dist < self.collision_dist
+        too_close = (nearest_dist >= self.collision_dist) & (nearest_dist < min_d)
+        in_zone = (nearest_dist >= min_d) & (nearest_dist <= max_d)
 
-                if too_close > 0:
-                    self.social_comfort[env_idx, fish_idx] -= 0.05 * self.dt
-                elif in_comfort_zone > 0:
-                    self.social_comfort[env_idx, fish_idx] += 0.02 * self.dt
-                else:
-                    self.social_comfort[env_idx, fish_idx] -= 0.01 * self.dt
+        rewards -= np.where(collision, self.separation_penalty, 0)
+        rewards -= np.where(too_close, 0.02 * (min_d - nearest_dist) / min_d, 0)
 
-                self.social_comfort[env_idx, fish_idx] = np.clip(
-                    self.social_comfort[env_idx, fish_idx], 0.0, 1.0
-                )
+        zone_center = (min_d + max_d) / 2
+        zone_half = (max_d - min_d) / 2
+        rewards += np.where(in_zone, self.cohesion_reward * (1 - np.abs(nearest_dist - zone_center) / zone_half), 0)
+
+        cos_a, sin_a = np.cos(self.angle), np.sin(self.angle)
+        heading = np.stack([cos_a, sin_a], axis=-1)
+        heading_i = heading[:, :, np.newaxis, :]
+        heading_j = heading[:, np.newaxis, :, :]
+        heading_dot_all = np.sum(heading_i * heading_j, axis=3)
+        nearest_heading_dot = np.take_along_axis(heading_dot_all, nearest_idx[:, :, np.newaxis], axis=2).squeeze(-1)
+        aligned = nearest_heading_dot > 0.7
+        rewards += np.where(aligned, self.alignment_reward * (nearest_heading_dot - 0.7) / 0.3, 0)
+
+        too_close_any = np.any(dists < self.collision_dist, axis=2)
+        in_comfort = np.any((dists > min_d[:, :, np.newaxis]) & (dists < max_d[:, :, np.newaxis]) & ~eye_mask, axis=2)
+
+        self.social_comfort -= np.where(too_close_any, 0.05 * self.dt, 0)
+        self.social_comfort += np.where(~too_close_any & in_comfort, 0.02 * self.dt, 0)
+        self.social_comfort -= np.where(~too_close_any & ~in_comfort, 0.01 * self.dt, 0)
+        self.social_comfort = np.clip(self.social_comfort, 0.0, 1.0)
 
         return rewards
 
-    def _cast_rays_single(self, env_idx, fish_idx):
-        """Cast rays for a single fish."""
-        rays = np.zeros(self.NUM_RAYS * 2, dtype=np.float32)
+    def _cast_rays_batch(self):
+        n, m, r = self.num_envs, self.num_fish, self.NUM_RAYS
+        rays = np.zeros((n, m, r * 2), dtype=np.float32)
+        rays[:, :, 0::2] = 1.0
 
+        food_mask = np.arange(self.max_food)[np.newaxis, :] < self.food_count[:, np.newaxis]
+        if not food_mask.any():
+            return rays
+
+        angles = self.angle[:, :, np.newaxis] + self.ray_angles_rel
+        ray_dirs = np.stack([np.cos(angles), np.sin(angles)], axis=-1)  # (n, m, r, 2)
+
+        fp = self.food[:, :, :2]  # (n, max_food, 2)
+        fa = self.food_aoe_base + self.food[:, :, 2] * self.food_aoe_growth  # (n, max_food)
+
+        to_food = fp[:, np.newaxis, :, :] - self.pos[:, :, np.newaxis, :]  # (n, m, max_food, 2)
+        to_food[:, :, :, 0] = np.where(to_food[:, :, :, 0] > self.width/2, to_food[:, :, :, 0] - self.width, to_food[:, :, :, 0])
+        to_food[:, :, :, 0] = np.where(to_food[:, :, :, 0] < -self.width/2, to_food[:, :, :, 0] + self.width, to_food[:, :, :, 0])
+        to_food[:, :, :, 1] = np.where(to_food[:, :, :, 1] > self.height/2, to_food[:, :, :, 1] - self.height, to_food[:, :, :, 1])
+        to_food[:, :, :, 1] = np.where(to_food[:, :, :, 1] < -self.height/2, to_food[:, :, :, 1] + self.height, to_food[:, :, :, 1])
+
+        proj = np.einsum('nmfd,nmrd->nmrf', to_food, ray_dirs)  # (n, m, r, max_food)
+        closest = ray_dirs[:, :, :, np.newaxis, :] * proj[:, :, :, :, np.newaxis]  # (n, m, r, max_food, 2)
+        dist_to_center = np.linalg.norm(to_food[:, :, np.newaxis, :, :] - closest, axis=4)  # (n, m, r, max_food)
+
+        valid = (proj > 0) & (proj < self.MAX_RAY_LENGTH) & food_mask[:, np.newaxis, np.newaxis, :]
+        hit = valid & (dist_to_center < fa[:, np.newaxis, np.newaxis, :])
+
+        proj_masked = np.where(hit, proj, self.MAX_RAY_LENGTH + 1)
+        best_idx = np.argmin(proj_masked, axis=3)  # (n, m, r)
+        best_proj = np.take_along_axis(proj, best_idx[:, :, :, np.newaxis], axis=3).squeeze(-1)
+        best_dist = np.take_along_axis(dist_to_center, best_idx[:, :, :, np.newaxis], axis=3).squeeze(-1)
+        best_aoe = np.take_along_axis(fa[:, np.newaxis, np.newaxis, :], best_idx[:, :, :, np.newaxis], axis=3).squeeze(-1)
+        any_hit = np.any(hit, axis=3)
+
+        rays[:, :, 0::2] = np.where(any_hit, best_proj / self.MAX_RAY_LENGTH, 1.0)
+        rays[:, :, 1::2] = np.where(any_hit, 1.0 - best_dist / best_aoe, 0.0)
+
+        return rays
+
+    def _sense_lateral_batch(self):
+        n, m, s = self.num_envs, self.num_fish, self.NUM_LATERAL_SENSORS
+        lateral = np.zeros((n, m, s * 2), dtype=np.float32)
+
+        food_mask = np.arange(self.max_food)[np.newaxis, :] < self.food_count[:, np.newaxis]
+        if not food_mask.any():
+            return lateral
+
+        cos_a, sin_a = np.cos(self.angle), np.sin(self.angle)
+        heading = np.stack([cos_a, sin_a], axis=-1)  # (n, m, 2)
+        perp = np.stack([-sin_a, cos_a], axis=-1)
+
+        along = self.lateral_along[np.newaxis, np.newaxis, :, np.newaxis]  # (1, 1, s, 1)
+        side = self.lateral_side[np.newaxis, np.newaxis, :, np.newaxis] * self.lateral_perp_dist
+
+        sensor_pos = (self.pos[:, :, np.newaxis, :] +
+                      heading[:, :, np.newaxis, :] * along +
+                      perp[:, :, np.newaxis, :] * side)  # (n, m, s, 2)
+
+        fp = self.food[:, :, :2]  # (n, max_food, 2)
+        fa = self.food_aoe_base + self.food[:, :, 2] * self.food_aoe_growth  # (n, max_food)
+
+        to_food = fp[:, np.newaxis, np.newaxis, :, :] - sensor_pos[:, :, :, np.newaxis, :]  # (n, m, s, max_food, 2)
+        to_food[:, :, :, :, 0] = np.where(to_food[:, :, :, :, 0] > self.width/2, to_food[:, :, :, :, 0] - self.width, to_food[:, :, :, :, 0])
+        to_food[:, :, :, :, 0] = np.where(to_food[:, :, :, :, 0] < -self.width/2, to_food[:, :, :, :, 0] + self.width, to_food[:, :, :, :, 0])
+        to_food[:, :, :, :, 1] = np.where(to_food[:, :, :, :, 1] > self.height/2, to_food[:, :, :, :, 1] - self.height, to_food[:, :, :, :, 1])
+        to_food[:, :, :, :, 1] = np.where(to_food[:, :, :, :, 1] < -self.height/2, to_food[:, :, :, :, 1] + self.height, to_food[:, :, :, :, 1])
+
+        dist = np.linalg.norm(to_food, axis=4)  # (n, m, s, max_food)
+        sensing_range = fa[:, np.newaxis, np.newaxis, :] * 2
+        valid = (dist > 0.1) & (dist < sensing_range) & food_mask[:, np.newaxis, np.newaxis, :]
+        intensity = np.where(valid, (sensing_range - dist) / sensing_range, 0)
+
+        dist_safe = np.maximum(dist, 0.1)
+        direction = to_food / dist_safe[:, :, :, :, np.newaxis]
+        pressure = np.sum(direction * intensity[:, :, :, :, np.newaxis], axis=3)  # (n, m, s, 2)
+
+        pressure_x = np.sum(pressure * heading[:, :, np.newaxis, :], axis=3)
+        pressure_y = np.sum(pressure * perp[:, :, np.newaxis, :], axis=3)
+
+        lateral[:, :, 0::2] = np.clip(pressure_x / 2.0, -1, 1)
+        lateral[:, :, 1::2] = np.clip(pressure_y / 2.0, -1, 1)
+
+        return lateral
+
+    def _cast_rays_single(self, env_idx, fish_idx):
+        rays = np.zeros(self.NUM_RAYS * 2, dtype=np.float32)
         if self.food_count[env_idx] == 0:
             rays[0::2] = 1.0
             return rays
-
         pos = self.pos[env_idx, fish_idx]
         angle = self.angle[env_idx, fish_idx]
         food_positions = self.food[env_idx, :self.food_count[env_idx], :2]
@@ -747,45 +747,43 @@ class PufferFishEnv:
         return lateral
 
     def _check_eating(self):
-        """Check eating for all environments."""
-        eaten = np.zeros((self.num_envs, self.num_fish), dtype=np.int32)
+        n, m = self.num_envs, self.num_fish
+        eaten = np.zeros((n, m), dtype=np.int32)
 
-        for env_idx in range(self.num_envs):
-            i = 0
-            while i < self.food_count[env_idx]:
-                food_pos = self.food[env_idx, i, :2]
-                food_eaten = False
+        for env_idx in range(n):
+            fc = self.food_count[env_idx]
+            if fc == 0:
+                continue
 
-                for fish_idx in range(self.num_fish):
-                    diff = self.pos[env_idx, fish_idx] - food_pos
-                    if diff[0] > self.width / 2:
-                        diff[0] -= self.width
-                    elif diff[0] < -self.width / 2:
-                        diff[0] += self.width
-                    if diff[1] > self.height / 2:
-                        diff[1] -= self.height
-                    elif diff[1] < -self.height / 2:
-                        diff[1] += self.height
+            fp = self.food[env_idx, :fc, :2]
+            fish_pos = self.pos[env_idx]
 
-                    dist = np.linalg.norm(diff)
+            diff = fish_pos[:, np.newaxis, :] - fp[np.newaxis, :, :]
+            diff[:, :, 0] = np.where(diff[:, :, 0] > self.width/2, diff[:, :, 0] - self.width, diff[:, :, 0])
+            diff[:, :, 0] = np.where(diff[:, :, 0] < -self.width/2, diff[:, :, 0] + self.width, diff[:, :, 0])
+            diff[:, :, 1] = np.where(diff[:, :, 1] > self.height/2, diff[:, :, 1] - self.height, diff[:, :, 1])
+            diff[:, :, 1] = np.where(diff[:, :, 1] < -self.height/2, diff[:, :, 1] + self.height, diff[:, :, 1])
 
-                    if dist < self.eat_radius:
-                        eaten[env_idx, fish_idx] += 1
-                        self.hunger[env_idx, fish_idx] = min(
-                            1.0, self.hunger[env_idx, fish_idx] + self.hunger_eat_restore
-                        )
-                        self.food[env_idx, i] = self.food[env_idx, self.food_count[env_idx] - 1]
-                        self.food_count[env_idx] -= 1
-                        food_eaten = True
-                        break
+            dists = np.linalg.norm(diff, axis=2)
+            can_eat = dists < self.eat_radius
 
-                if not food_eaten:
-                    i += 1
+            to_remove = []
+            for food_idx in range(fc):
+                eaters = np.where(can_eat[:, food_idx])[0]
+                if len(eaters) > 0:
+                    fish_idx = eaters[0]
+                    eaten[env_idx, fish_idx] += 1
+                    self.hunger[env_idx, fish_idx] = min(1.0, self.hunger[env_idx, fish_idx] + self.hunger_eat_restore)
+                    to_remove.append(food_idx)
+                    can_eat[:, food_idx] = False
+
+            for food_idx in sorted(to_remove, reverse=True):
+                self.food[env_idx, food_idx] = self.food[env_idx, self.food_count[env_idx] - 1]
+                self.food_count[env_idx] -= 1
 
         return eaten
 
     def _compute_equilibrium_reward(self, food_eaten):
-        """Compute equilibrium rewards for all fish."""
         rewards = food_eaten.astype(np.float32) * 1.0
 
         hunger_reward = -np.abs(self.hunger - 0.6) * 0.1
@@ -800,34 +798,26 @@ class PufferFishEnv:
         return rewards
 
     def _compute_exploration_reward(self):
-        """Compute exploration rewards for all fish."""
-        n = self.num_envs
-        m = self.num_fish
+        n, m = self.num_envs, self.num_fish
         rewards = np.zeros((n, m), dtype=np.float32)
+
+        grid_x = (self.pos[:, :, 0] / self.grid_size).astype(np.int32)
+        grid_y = (self.pos[:, :, 1] / self.grid_size).astype(np.int32)
 
         for env_idx in range(n):
             for fish_idx in range(m):
-                grid_x = int(self.pos[env_idx, fish_idx, 0] / self.grid_size)
-                grid_y = int(self.pos[env_idx, fish_idx, 1] / self.grid_size)
-                cell = (grid_x, grid_y)
-
+                cell = (grid_x[env_idx, fish_idx], grid_y[env_idx, fish_idx])
                 if cell not in self.visited_cells[env_idx][fish_idx]:
                     self.visited_cells[env_idx][fish_idx].add(cell)
                     rewards[env_idx, fish_idx] += self.visit_bonus
 
-                diff = self.pos[env_idx, fish_idx] - self.prev_pos[env_idx, fish_idx]
-                if diff[0] > self.width / 2:
-                    diff[0] -= self.width
-                elif diff[0] < -self.width / 2:
-                    diff[0] += self.width
-                if diff[1] > self.height / 2:
-                    diff[1] -= self.height
-                elif diff[1] < -self.height / 2:
-                    diff[1] += self.height
+        diff = self.pos - self.prev_pos
+        diff[:, :, 0] = np.where(diff[:, :, 0] > self.width/2, diff[:, :, 0] - self.width, diff[:, :, 0])
+        diff[:, :, 0] = np.where(diff[:, :, 0] < -self.width/2, diff[:, :, 0] + self.width, diff[:, :, 0])
+        diff[:, :, 1] = np.where(diff[:, :, 1] > self.height/2, diff[:, :, 1] - self.height, diff[:, :, 1])
+        diff[:, :, 1] = np.where(diff[:, :, 1] < -self.height/2, diff[:, :, 1] + self.height, diff[:, :, 1])
 
-                distance = np.linalg.norm(diff)
-                rewards[env_idx, fish_idx] += distance * self.distance_bonus
-
+        rewards += np.linalg.norm(diff, axis=2) * self.distance_bonus
         self.prev_pos = self.pos.copy()
         return rewards
 
@@ -846,3 +836,63 @@ class PufferFishEnv:
             idx = self.food_count[env_idx]
             self.food[env_idx, idx] = [x, y, 0.0]
             self.food_count[env_idx] += 1
+
+    def _get_initial_food(self):
+        max_start = self.config.get("food_decay_max", 100)
+        warmup = self.config.get("food_decay_warmup", 500_000)
+        rate = self.config.get("food_decay_rate", 0.00001)
+        floor = self.config.get("food_decay_floor", 10)
+        step = getattr(self, 'global_step', 0)
+        if step < warmup:
+            return max_start
+        return int((max_start - floor) / (np.exp(rate * (step - warmup)) + 1) + floor)
+
+    def render(self, env_idx=0):
+        import pygame
+        if not hasattr(self, '_screen') or not pygame.get_init():
+            pygame.init()
+            self._screen = pygame.display.set_mode((self.width, self.height))
+            pygame.display.set_caption('PufferFish Training')
+            self._clock = pygame.time.Clock()
+            self._font = pygame.font.Font(None, 24)
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                pygame.quit()
+                return
+
+        self._screen.fill((20, 40, 60))
+
+        for i in range(self.food_count[env_idx]):
+            fx, fy = self.food[env_idx, i, :2]
+            age = self.food[env_idx, i, 2]
+            radius = int(self.food_aoe_base + age * self.food_aoe_growth)
+            pygame.draw.circle(self._screen, (80, 200, 80), (int(fx), int(fy)), radius, 1)
+            pygame.draw.circle(self._screen, (120, 255, 120), (int(fx), int(fy)), 5)
+
+        for fish_idx in range(self.num_fish):
+            x, y = self.pos[env_idx, fish_idx]
+            angle = self.angle[env_idx, fish_idx]
+
+            cos_a, sin_a = np.cos(angle), np.sin(angle)
+            head = (int(x + cos_a * 30), int(y + sin_a * 30))
+            tail = (int(x - cos_a * 30), int(y - sin_a * 30))
+
+            colors = [(232, 85, 48), (100, 180, 255), (255, 200, 50)]
+            color = colors[fish_idx % len(colors)]
+            pygame.draw.line(self._screen, color, tail, head, 4)
+            pygame.draw.circle(self._screen, color, head, 8)
+
+            vx, vy = self.vel[env_idx, fish_idx]
+            speed = np.sqrt(vx*vx + vy*vy)
+            hunger = self.hunger[env_idx, fish_idx]
+            txt = self._font.render(f'{speed:.0f} h:{hunger:.2f}', True, (255, 255, 255))
+            self._screen.blit(txt, (int(x) - 20, int(y) - 25))
+
+        step = getattr(self, 'global_step', 0)
+        food_target = self._get_initial_food()
+        info = self._font.render(f'Step: {step:,}  Food: {self.food_count[env_idx]}/{food_target}', True, (255, 255, 255))
+        self._screen.blit(info, (10, 10))
+
+        pygame.display.flip()
+        self._clock.tick(self.config.get("render_fps", 30))

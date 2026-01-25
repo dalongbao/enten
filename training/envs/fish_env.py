@@ -1,28 +1,4 @@
-"""
-Multi-fish Gymnasium environment for RL training.
-
-Supports N fish (default 3) swimming in the same environment with:
-- Independent physics and control per fish
-- Shared food system (fish compete for food)
-- Social dynamics (schooling rewards based on proximity)
-- Observation includes other fish positions
-
-NEW HYBRID PHYSICS - Model controls high-level movement:
-- speed [0, 1]: Desired forward speed
-- direction [-1, 1]: Turn rate (-1=left, +1=right)
-- urgency [0, 1]: Movement intensity (affects tail frequency)
-
-Fin animation is computed automatically from movement.
-Thrust scales with fin area (different goldfish varieties swim differently).
-
-Perception (per fish):
-- 16 raycasts in 180° frontal arc → 32 features
-- 8 lateral line sensors (4 per side) → 16 features
-- 4 proprioceptive features (forward vel, lateral vel, angular vel, speed)
-- 4 internal state features (hunger, stress, social_comfort, energy)
-- 4 social features (nearest_dist, nearest_angle, num_nearby, heading_diff)
-- Total: 60 features per fish
-"""
+"""Multi-fish Gymnasium environment for RL training."""
 
 import numpy as np
 import gymnasium as gym
@@ -36,16 +12,19 @@ class FishEnv(gym.Env):
 
     # Perception constants
     NUM_RAYS = 16
-    RAY_ARC = np.pi  # 180 degrees
-    MAX_RAY_LENGTH = 200.0
+    RAY_ARC = np.pi * 1.5  # 270 degrees
+    MAX_RAY_LENGTH = 450.0
     NUM_LATERAL_SENSORS = 8
 
     # Observation: raycasts (32) + lateral (16) + proprio (4) + internal (4) + social (4) = 60
     OBS_DIM = NUM_RAYS * 2 + NUM_LATERAL_SENSORS * 2 + 4 + 4 + 4
 
-    # Tail frequency range (very slow for goldfish: 0.3-0.5 Hz)
-    TAIL_FREQ_MIN = 0.3
-    TAIL_FREQ_MAX = 0.5
+    # Fin-based physics constants
+    FIN_BODY_FREQ_MIN = 0.5
+    FIN_BODY_FREQ_MAX = 4.0
+    FIN_PEC_FREQ_MIN = 0.0
+    FIN_PEC_FREQ_MAX = 3.0
+    FIN_PEC_LEVER_ARM = 30.0
 
     def __init__(self, config=None, render_mode=None):
         super().__init__()
@@ -64,16 +43,16 @@ class FishEnv(gym.Env):
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.num_fish * self.OBS_DIM,), dtype=np.float32
         )
-        # 3 outputs per fish - speed, direction, urgency
+        # 6 outputs per fish - body_freq, body_amp, left_pec_freq, left_pec_amp, right_pec_freq, right_pec_amp
         self.action_space = spaces.Box(
-            low=np.tile([0.0, -1.0, 0.0], self.num_fish).astype(np.float32),
-            high=np.tile([1.0, 1.0, 1.0], self.num_fish).astype(np.float32),
+            low=np.tile([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], self.num_fish).astype(np.float32),
+            high=np.tile([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], self.num_fish).astype(np.float32),
             dtype=np.float32,
         )
 
         # Per-fish observation/action spaces (for reference)
         self.single_obs_dim = self.OBS_DIM
-        self.single_action_dim = 3
+        self.single_action_dim = 6
 
         # Goldfish variety (can be configured)
         variety = self.config.get("variety", "common")
@@ -216,15 +195,40 @@ class FishEnv(gym.Env):
 
     def step(self, action):
         action = np.asarray(action, dtype=np.float32)
-        # Reshape flattened action to (num_fish, 3)
-        actions = action.reshape(self.num_fish, 3)
+        # Reshape flattened action to (num_fish, 6)
+        actions = action.reshape(self.num_fish, 6)
 
-        # Physics update for each fish
+        # Physics update for each fish using fin-based control
         for i in range(self.num_fish):
-            speed = float(np.clip(actions[i, 0], 0.0, 1.0))
-            direction = float(np.clip(actions[i, 1], -1.0, 1.0))
-            urgency = float(np.clip(actions[i, 2], 0.0, 1.0))
-            self._physics_step_single(i, speed, direction, urgency)
+            body_freq = float(np.clip(actions[i, 0], 0.0, 1.0))
+            body_amp = float(np.clip(actions[i, 1], 0.0, 1.0))
+            left_pec_freq = float(np.clip(actions[i, 2], 0.0, 1.0))
+            left_pec_amp = float(np.clip(actions[i, 3], 0.0, 1.0))
+            right_pec_freq = float(np.clip(actions[i, 4], 0.0, 1.0))
+            right_pec_amp = float(np.clip(actions[i, 5], 0.0, 1.0))
+            self._physics_step_fin(i, body_freq, body_amp, left_pec_freq, left_pec_amp, right_pec_freq, right_pec_amp)
+
+        # Collision avoidance between fish
+        collision_radius = 100.0
+        separation_force = 300.0
+        for i in range(self.num_fish):
+            sep_x, sep_y = 0.0, 0.0
+            for j in range(self.num_fish):
+                if i == j:
+                    continue
+                dx = self.pos[i, 0] - self.pos[j, 0]
+                dy = self.pos[i, 1] - self.pos[j, 1]
+                dist = np.sqrt(dx * dx + dy * dy)
+                if dist < collision_radius and dist > 0.1:
+                    strength = ((collision_radius - dist) / collision_radius) ** 2
+                    sep_x += (dx / dist) * strength * separation_force
+                    sep_y += (dy / dist) * strength * separation_force
+            self.vel[i, 0] += sep_x * self.dt
+            self.vel[i, 1] += sep_y * self.dt
+
+        # Screen wrapping (infinite canvas)
+        self.pos[:, 0] = self.pos[:, 0] % self.width
+        self.pos[:, 1] = self.pos[:, 1] % self.height
 
         # Age food (increases AOE)
         if self.food_count > 0:
@@ -256,67 +260,101 @@ class FishEnv(gym.Env):
 
         return self._get_obs(), total_reward, terminated, truncated, {}
 
-    def _physics_step_single(self, fish_idx: int, speed: float, direction: float, urgency: float):
-        """Hybrid physics for a single fish: model controls speed/direction/urgency, fins auto-animate."""
+    def _physics_step_fin(self, fish_idx: int, body_freq: float, body_amp: float,
+                          left_pec_freq: float, left_pec_amp: float,
+                          right_pec_freq: float, right_pec_amp: float):
+        """Fin-based physics for a single fish: direct fin control drives movement."""
         i = fish_idx
 
-        # === TAIL ANIMATION (auto-computed from speed & urgency) ===
-        tail_freq = self.TAIL_FREQ_MIN + urgency * (self.TAIL_FREQ_MAX - self.TAIL_FREQ_MIN)
-        self.tail_phase[i] += tail_freq * 2.0 * np.pi * self.dt
+        # Map normalized actions to physical parameters
+        actual_body_freq = self.FIN_BODY_FREQ_MIN + body_freq * (self.FIN_BODY_FREQ_MAX - self.FIN_BODY_FREQ_MIN)
+        actual_body_amp = body_amp
+
+        # === TAIL ANIMATION ===
+        self.tail_phase[i] += actual_body_freq * 2.0 * np.pi * self.dt
         if self.tail_phase[i] > 2.0 * np.pi:
             self.tail_phase[i] -= 2.0 * np.pi
 
-        # === BODY CURVE (auto-computed from direction) ===
-        target_curve = direction * 0.4
-        self.body_curve[i] += (target_curve - self.body_curve[i]) * 5.0 * self.dt
+        # === THRUST FROM TAIL ===
+        # Thrust comes from body wave: thrust = coeff * amplitude * frequency * fin_area
+        fin_area = self.body_length * self.fin_area_mult * 0.1
+        thrust = self.thrust_coeff * actual_body_amp * actual_body_freq * fin_area
 
-        # === PECTORAL FINS (auto-computed from direction & speed) ===
-        base_pec = 0.3 - speed * 0.2
-        self.left_pectoral[i] = base_pec + direction * 0.3
-        self.right_pectoral[i] = base_pec - direction * 0.3
-
-        # === ROTATION ===
-        effective_turn_rate = self.turn_rate * (0.5 + urgency * 0.5)
-        self.angular_vel[i] = direction * effective_turn_rate
-        self.angle[i] += self.angular_vel[i] * self.dt
-
-        # === THRUST ===
-        # Pulsed based on tail phase
+        # Modulate by tail phase (peak thrust at mid-stroke)
         tail_pulse = np.sin(self.tail_phase[i]) ** 2
-
-        # Effective thrust: base + urgency boost, modulated by tail pulse
-        thrust_factor = 0.3 + urgency * 0.7
-        thrust = speed * self.thrust_coeff * self.fin_area_mult * thrust_factor
         thrust *= (0.5 + tail_pulse * 0.5)
 
-        # Thrust direction (slightly affected by body curve)
+        # === TORQUE FROM PECTORAL FINS ===
+        left_pec_actual_freq = self.FIN_PEC_FREQ_MIN + left_pec_freq * (self.FIN_PEC_FREQ_MAX - self.FIN_PEC_FREQ_MIN)
+        right_pec_actual_freq = self.FIN_PEC_FREQ_MIN + right_pec_freq * (self.FIN_PEC_FREQ_MAX - self.FIN_PEC_FREQ_MIN)
+
+        left_force = left_pec_amp * left_pec_actual_freq
+        right_force = right_pec_amp * right_pec_actual_freq
+        torque = (right_force - left_force) * self.FIN_PEC_LEVER_ARM
+
+        # Update angular velocity from torque
+        self.angular_vel[i] += torque / self.mass * self.dt
+
+        # Angular drag to prevent spinning forever
+        angular_drag = 0.95
+        self.angular_vel[i] *= angular_drag ** (self.dt * 60.0)
+
+        # Update angle
+        self.angle[i] += self.angular_vel[i] * self.dt
+
+        # === BODY CURVE (based on turning) ===
+        target_curve = self.angular_vel[i] * 0.3
+        self.body_curve[i] += (target_curve - self.body_curve[i]) * 5.0 * self.dt
+
+        # Update pectoral fin display values
+        self.left_pectoral[i] = left_pec_amp
+        self.right_pectoral[i] = right_pec_amp
+
+        # === VELOCITY UPDATE ===
+        cos_a = np.cos(self.angle[i])
+        sin_a = np.sin(self.angle[i])
+
+        # Thrust in facing direction (adjusted by body curve)
         thrust_angle = self.angle[i] - self.body_curve[i] * 0.2
         fx = thrust * np.cos(thrust_angle)
         fy = thrust * np.sin(thrust_angle)
 
-        # === DRAG ===
+        # Current speed for drag calculation
         self.current_speed[i] = np.linalg.norm(self.vel[i])
-        effective_drag = self.drag_coeff * self.fin_area_mult
-        effective_drag += abs(self.body_curve[i]) * 2.0
 
-        if self.current_speed[i] > 0.0001:
-            drag_force = effective_drag * self.current_speed[i]
-            fx -= drag_force * (self.vel[i, 0] / self.current_speed[i])
-            fy -= drag_force * (self.vel[i, 1] / self.current_speed[i])
+        # Decompose velocity into forward/lateral components
+        v_forward = self.vel[i, 0] * cos_a + self.vel[i, 1] * sin_a
+        v_lateral = -self.vel[i, 0] * sin_a + self.vel[i, 1] * cos_a
 
-        # === INTEGRATION ===
-        ax = fx / self.mass
-        ay = fy / self.mass
+        # Drag model (lateral drag much higher than forward)
+        base_drag = self.drag_coeff * self.fin_area_mult * 0.01
+        lateral_mult = 10.0
+        curve_drag = abs(self.body_curve[i]) * 0.5
+
+        drag_forward = (base_drag + curve_drag) * v_forward * abs(v_forward)
+        drag_lateral = (base_drag * lateral_mult) * v_lateral * abs(v_lateral)
+
+        drag_x = drag_forward * cos_a - drag_lateral * sin_a
+        drag_y = drag_forward * sin_a + drag_lateral * cos_a
+
+        fx -= drag_x
+        fy -= drag_y
+
+        # Integration
+        effective_mass = self.mass * 1.3
+        ax = fx / effective_mass
+        ay = fy / effective_mass
+
         self.vel[i, 0] += ax * self.dt
         self.vel[i, 1] += ay * self.dt
         self.pos[i, 0] += self.vel[i, 0] * self.dt
         self.pos[i, 1] += self.vel[i, 1] * self.dt
 
         # === INTERNAL STATE UPDATES ===
-        # Energy: depleted by movement, recovered by resting
-        movement_intensity = speed * (0.3 + urgency * 0.7)
+        # Energy cost based on fin activity
+        movement_intensity = body_amp * body_freq + (left_pec_amp * left_pec_freq + right_pec_amp * right_pec_freq) * 0.5
         self.energy[i] -= self.energy_cost_base * movement_intensity
-        self.energy[i] += self.energy_recovery_rate * (1.0 - speed) * self.dt
+        self.energy[i] += self.energy_recovery_rate * (1.0 - movement_intensity) * self.dt
         self.energy[i] = np.clip(self.energy[i], 0.0, 1.0)
 
         # Hunger: slowly decays
@@ -326,15 +364,7 @@ class FishEnv(gym.Env):
         # Stress: slowly decays when calm
         self.stress[i] *= (1.0 - self.stress_decay_rate * self.dt)
 
-        # === WRAP AROUND ===
-        if self.pos[i, 0] < 0:
-            self.pos[i, 0] += self.width
-        if self.pos[i, 0] >= self.width:
-            self.pos[i, 0] -= self.width
-        if self.pos[i, 1] < 0:
-            self.pos[i, 1] += self.height
-        if self.pos[i, 1] >= self.height:
-            self.pos[i, 1] -= self.height
+        # Boundary handling done after all fish updated in step()
 
     def _get_obs(self):
         """Construct observation vector for all fish (flattened)."""

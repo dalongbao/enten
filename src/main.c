@@ -8,26 +8,44 @@
 #define MIN_HEIGHT 256
 #define FRAME_DT (1.0f / 60.0f)
 
-// Global state
 static Simulation gSim;
 static int gScreenWidth = 1920;
 static int gScreenHeight = 1080;
-// Action inputs (3 controls - hybrid system)
-static float gSpeed = 0.5f;        // Desired speed [0, 1]
-static float gDirection = 0.0f;    // Turn direction [-1, 1]
-static float gUrgency = 0.3f;      // Movement urgency [0, 1]
 
-// Forward declarations
+// Legacy action mode
+static float gSpeed = 0.5f;
+static float gDirection = 0.0f;
+static float gUrgency = 0.3f;
+
+// New fin-based action mode
+static FinAction gFinAction = {0.5f, 0.5f, 0.5f, 0.3f, 0.5f, 0.3f};
+static int gUseFinMode = 0;  // 0 = legacy/boid, 1 = fin-based control
+
+
 static EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data);
 static void main_loop(void);
 
-// --- WASM Exports ---
-
+// Legacy action interface - maps to fin-based internally
 EMSCRIPTEN_KEEPALIVE
 void set_action(float speed, float direction, float urgency) {
     gSpeed = speed;
     gDirection = direction;
     gUrgency = urgency;
+    gUseFinMode = 0;
+}
+
+// New fin-based action interface (6 actions)
+EMSCRIPTEN_KEEPALIVE
+void set_fin_action(float body_freq, float body_amp,
+                    float left_pec_freq, float left_pec_amp,
+                    float right_pec_freq, float right_pec_amp) {
+    gFinAction.body_freq = body_freq;
+    gFinAction.body_amp = body_amp;
+    gFinAction.left_pec_freq = left_pec_freq;
+    gFinAction.left_pec_amp = left_pec_amp;
+    gFinAction.right_pec_freq = right_pec_freq;
+    gFinAction.right_pec_amp = right_pec_amp;
+    gUseFinMode = 1;
 }
 
 EMSCRIPTEN_KEEPALIVE
@@ -40,128 +58,29 @@ EMSCRIPTEN_KEEPALIVE
 float get_angle(void) { return gSim.fish[0].state.angle; }
 
 EMSCRIPTEN_KEEPALIVE
-float get_vx(void) { return gSim.fish[0].state.vel.x; }
-
-EMSCRIPTEN_KEEPALIVE
-float get_vy(void) { return gSim.fish[0].state.vel.y; }
-
-EMSCRIPTEN_KEEPALIVE
 int get_food_count(void) { return gSim.food_count; }
 
 EMSCRIPTEN_KEEPALIVE
-void get_observation(float* obs) {
-    sim_get_obs(&gSim, 0, obs);
+float get_food_x(int idx) {
+    if (idx >= 0 && idx < gSim.food_count)
+        return gSim.food[idx].pos.x;
+    return 0.0f;
 }
 
 EMSCRIPTEN_KEEPALIVE
-void drop_food(int x, int y) {
-    sim_add_food(&gSim, (float)x, (float)y);
+float get_food_y(int idx) {
+    if (idx >= 0 && idx < gSim.food_count)
+        return gSim.food[idx].pos.y;
+    return 0.0f;
 }
 
-// --- Multi-fish exports ---
+EMSCRIPTEN_KEEPALIVE
+void spawn_food(float x, float y) {
+    sim_add_food(&gSim, x, y);
+}
 
 EMSCRIPTEN_KEEPALIVE
 int get_fish_count_sim(void) { return gSim.fish_count; }
-
-EMSCRIPTEN_KEEPALIVE
-void set_action_for_fish(int fish_id, float speed, float direction, float urgency) {
-    if (fish_id >= 0 && fish_id < MAX_FISH) {
-        // Store in per-fish action array for next step
-        // For now, we use global action for all fish controlled via set_action()
-        // This function is for future per-fish control from JS
-    }
-}
-
-EMSCRIPTEN_KEEPALIVE
-float get_x_for_fish(int fish_id) {
-    if (fish_id >= 0 && fish_id < gSim.fish_count)
-        return gSim.fish[fish_id].state.pos.x;
-    return 0.0f;
-}
-
-EMSCRIPTEN_KEEPALIVE
-float get_y_for_fish(int fish_id) {
-    if (fish_id >= 0 && fish_id < gSim.fish_count)
-        return gSim.fish[fish_id].state.pos.y;
-    return 0.0f;
-}
-
-EMSCRIPTEN_KEEPALIVE
-float get_angle_for_fish(int fish_id) {
-    if (fish_id >= 0 && fish_id < gSim.fish_count)
-        return gSim.fish[fish_id].state.angle;
-    return 0.0f;
-}
-
-EMSCRIPTEN_KEEPALIVE
-void get_observation_for_fish(int fish_id, float* obs) {
-    sim_get_obs(&gSim, fish_id, obs);
-}
-
-// --- Fish state exports for JS rendering ---
-
-EMSCRIPTEN_KEEPALIVE
-float get_tail_phase(void) { return gSim.fish[0].state.tail.phase; }
-
-EMSCRIPTEN_KEEPALIVE
-float get_tail_amplitude(void) { return gSim.fish[0].state.tail.amplitude; }
-
-EMSCRIPTEN_KEEPALIVE
-float get_body_curve(void) { return gSim.fish[0].state.body_curve; }
-
-EMSCRIPTEN_KEEPALIVE
-float get_left_pectoral(void) { return gSim.fish[0].state.left_pectoral; }
-
-EMSCRIPTEN_KEEPALIVE
-float get_right_pectoral(void) { return gSim.fish[0].state.right_pectoral; }
-
-// Per-fish animation state exports
-EMSCRIPTEN_KEEPALIVE
-float get_tail_phase_for_fish(int fish_id) {
-    if (fish_id >= 0 && fish_id < gSim.fish_count)
-        return gSim.fish[fish_id].state.tail.phase;
-    return 0.0f;
-}
-
-EMSCRIPTEN_KEEPALIVE
-float get_tail_amplitude_for_fish(int fish_id) {
-    if (fish_id >= 0 && fish_id < gSim.fish_count)
-        return gSim.fish[fish_id].state.tail.amplitude;
-    return 0.0f;
-}
-
-EMSCRIPTEN_KEEPALIVE
-float get_body_curve_for_fish(int fish_id) {
-    if (fish_id >= 0 && fish_id < gSim.fish_count)
-        return gSim.fish[fish_id].state.body_curve;
-    return 0.0f;
-}
-
-EMSCRIPTEN_KEEPALIVE
-float get_left_pectoral_for_fish(int fish_id) {
-    if (fish_id >= 0 && fish_id < gSim.fish_count)
-        return gSim.fish[fish_id].state.left_pectoral;
-    return 0.0f;
-}
-
-EMSCRIPTEN_KEEPALIVE
-float get_right_pectoral_for_fish(int fish_id) {
-    if (fish_id >= 0 && fish_id < gSim.fish_count)
-        return gSim.fish[fish_id].state.right_pectoral;
-    return 0.0f;
-}
-
-// --- Food data exports ---
-
-EMSCRIPTEN_KEEPALIVE
-void get_food_positions(float* out) {
-    for (int i = 0; i < gSim.food_count; i++) {
-        out[i * 2] = gSim.food[i].pos.x;
-        out[i * 2 + 1] = gSim.food[i].pos.y;
-    }
-}
-
-// --- Screen dimension exports ---
 
 EMSCRIPTEN_KEEPALIVE
 int get_screen_w(void) { return gScreenWidth; }
@@ -169,12 +88,181 @@ int get_screen_w(void) { return gScreenWidth; }
 EMSCRIPTEN_KEEPALIVE
 int get_screen_h(void) { return gScreenHeight; }
 
-// --- Event Handlers ---
+EMSCRIPTEN_KEEPALIVE
+float get_fov_arc(void) { return SIM_RAY_ARC; }
+
+EMSCRIPTEN_KEEPALIVE
+float get_fov_range(void) { return SIM_RAY_MAX_DIST; }
+
+EMSCRIPTEN_KEEPALIVE
+float get_fish_angle(int fish_id) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count)
+        return gSim.fish[fish_id].state.angle;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_fish_x(int fish_id) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count)
+        return gSim.fish[fish_id].state.pos.x;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_fish_y(int fish_id) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count)
+        return gSim.fish[fish_id].state.pos.y;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int get_num_body_segments(void) { return NUM_BODY_SEGMENTS; }
+
+EMSCRIPTEN_KEEPALIVE
+float get_body_point_x(int fish_id, int point_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count && point_idx >= 0 && point_idx <= NUM_BODY_SEGMENTS)
+        return gSim.fish[fish_id].state.body.points[point_idx].x;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_body_point_y(int fish_id, int point_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count && point_idx >= 0 && point_idx <= NUM_BODY_SEGMENTS)
+        return gSim.fish[fish_id].state.body.points[point_idx].y;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_body_width(int fish_id, int point_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count && point_idx >= 0 && point_idx <= NUM_BODY_SEGMENTS)
+        return gSim.fish[fish_id].state.body.widths[point_idx];
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int get_num_tail_rays(void) { return NUM_TAIL_RAYS; }
+
+EMSCRIPTEN_KEEPALIVE
+int get_num_tail_joints(void) { return NUM_TAIL_JOINTS; }
+
+EMSCRIPTEN_KEEPALIVE
+float get_tail_joint_x(int fish_id, int ray_idx, int joint_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        ray_idx >= 0 && ray_idx < NUM_TAIL_RAYS &&
+        joint_idx >= 0 && joint_idx < NUM_TAIL_JOINTS)
+        return gSim.fish[fish_id].state.tail_fin.joints[ray_idx][joint_idx].x;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_tail_joint_y(int fish_id, int ray_idx, int joint_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        ray_idx >= 0 && ray_idx < NUM_TAIL_RAYS &&
+        joint_idx >= 0 && joint_idx < NUM_TAIL_JOINTS)
+        return gSim.fish[fish_id].state.tail_fin.joints[ray_idx][joint_idx].y;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int get_num_fin_rays(void) { return NUM_FIN_RAYS; }
+
+EMSCRIPTEN_KEEPALIVE
+int get_num_fin_joints(void) { return NUM_FIN_JOINTS; }
+
+EMSCRIPTEN_KEEPALIVE
+float get_pectoral_left_joint_x(int fish_id, int ray_idx, int joint_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        ray_idx >= 0 && ray_idx < NUM_FIN_RAYS &&
+        joint_idx >= 0 && joint_idx < NUM_FIN_JOINTS)
+        return gSim.fish[fish_id].state.pectoral_left.joints[ray_idx][joint_idx].x;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_pectoral_left_joint_y(int fish_id, int ray_idx, int joint_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        ray_idx >= 0 && ray_idx < NUM_FIN_RAYS &&
+        joint_idx >= 0 && joint_idx < NUM_FIN_JOINTS)
+        return gSim.fish[fish_id].state.pectoral_left.joints[ray_idx][joint_idx].y;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_pectoral_right_joint_x(int fish_id, int ray_idx, int joint_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        ray_idx >= 0 && ray_idx < NUM_FIN_RAYS &&
+        joint_idx >= 0 && joint_idx < NUM_FIN_JOINTS)
+        return gSim.fish[fish_id].state.pectoral_right.joints[ray_idx][joint_idx].x;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_pectoral_right_joint_y(int fish_id, int ray_idx, int joint_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        ray_idx >= 0 && ray_idx < NUM_FIN_RAYS &&
+        joint_idx >= 0 && joint_idx < NUM_FIN_JOINTS)
+        return gSim.fish[fish_id].state.pectoral_right.joints[ray_idx][joint_idx].y;
+    return 0.0f;
+}
+
+// Particle system accessors
+EMSCRIPTEN_KEEPALIVE
+int get_particle_count(int fish_id) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count)
+        return gSim.fish[fish_id].state.particles.count;
+    return 0;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_particle_x(int fish_id, int particle_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        particle_idx >= 0 && particle_idx < gSim.fish[fish_id].state.particles.count)
+        return gSim.fish[fish_id].state.particles.particles[particle_idx].pos.x;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_particle_y(int fish_id, int particle_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        particle_idx >= 0 && particle_idx < gSim.fish[fish_id].state.particles.count)
+        return gSim.fish[fish_id].state.particles.particles[particle_idx].pos.y;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_particle_alpha(int fish_id, int particle_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        particle_idx >= 0 && particle_idx < gSim.fish[fish_id].state.particles.count)
+        return gSim.fish[fish_id].state.particles.particles[particle_idx].alpha;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_particle_size(int fish_id, int particle_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        particle_idx >= 0 && particle_idx < gSim.fish[fish_id].state.particles.count)
+        return gSim.fish[fish_id].state.particles.particles[particle_idx].size;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_particle_angle(int fish_id, int particle_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        particle_idx >= 0 && particle_idx < gSim.fish[fish_id].state.particles.count)
+        return gSim.fish[fish_id].state.particles.particles[particle_idx].angle;
+    return 0.0f;
+}
+
+EMSCRIPTEN_KEEPALIVE
+float get_particle_length(int fish_id, int particle_idx) {
+    if (fish_id >= 0 && fish_id < gSim.fish_count &&
+        particle_idx >= 0 && particle_idx < gSim.fish[fish_id].state.particles.count)
+        return gSim.fish[fish_id].state.particles.particles[particle_idx].length;
+    return 0.0f;
+}
 
 static EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data) {
-    (void)type;
-    (void)e;
-    (void)data;
+    (void)type; (void)e; (void)data;
 
     double w = EM_ASM_DOUBLE({ return window.innerWidth; });
     double h = EM_ASM_DOUBLE({ return window.innerHeight; });
@@ -184,12 +272,10 @@ static EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data) {
 
     emscripten_set_canvas_element_size("#canvas", gScreenWidth, gScreenHeight);
 
-    // Update simulation dimensions
     gSim.screen_width = gScreenWidth;
     gSim.screen_height = gScreenHeight;
     sim_cull_food(&gSim);
 
-    // Clamp fish positions
     for (int i = 0; i < gSim.fish_count; i++) {
         if (gSim.fish[i].state.pos.x >= gScreenWidth)
             gSim.fish[i].state.pos.x = gScreenWidth - 1;
@@ -200,40 +286,39 @@ static EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data) {
     return EM_TRUE;
 }
 
-// --- Main Loop ---
-
 static void main_loop(void) {
-    // Build actions array for all fish (use same action for all in browser mode)
     float actions[MAX_FISH][3];
     for (int i = 0; i < gSim.fish_count; i++) {
         actions[i][0] = gSpeed;
         actions[i][1] = gDirection;
         actions[i][2] = gUrgency;
     }
-    // Step simulation (rendering is handled by JavaScript)
     sim_step(&gSim, actions, NULL);
+
+    for (int i = 0; i < gSim.fish_count; i++) {
+        fish_compute_body(&gSim.fish[i]);
+        fish_emit_particles(&gSim.fish[i], FRAME_DT);
+        fish_update_particles(&gSim.fish[i], FRAME_DT);
+    }
 }
 
-// --- Initialization ---
-
 static bool init(void) {
-    // Set up resize callback and trigger initial resize
     emscripten_set_resize_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, NULL, EM_FALSE, on_resize);
     on_resize(0, NULL, NULL);
 
-    // Initialize simulation
     sim_init(&gSim, gScreenWidth, gScreenHeight, FRAME_DT);
 
-    printf("Init: screen %dx%d, %d fish, fish[0] at %.1f,%.1f\n",
-           gScreenWidth, gScreenHeight, gSim.fish_count,
-           gSim.fish[0].state.pos.x, gSim.fish[0].state.pos.y);
+    for (int i = 0; i < gSim.fish_count; i++) {
+        fish_compute_body(&gSim.fish[i]);
+    }
+
+    printf("Init: screen %dx%d, %d fish\n", gScreenWidth, gScreenHeight, gSim.fish_count);
 
     return true;
 }
 
 int main(int argc, char *args[]) {
-    (void)argc;
-    (void)args;
+    (void)argc; (void)args;
 
     if (!init()) {
         printf("Failed to init\n");
