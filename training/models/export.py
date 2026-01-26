@@ -16,17 +16,8 @@ class PolicyForExport(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         action_mean, _, _ = self.policy.forward(obs)
-
-        action = torch.stack(
-            [
-                torch.sigmoid(action_mean[:, 0]),
-                torch.tanh(action_mean[:, 1]),
-                torch.sigmoid(action_mean[:, 2]),
-            ],
-            dim=1,
-        )
-
-        return action
+        # 6 fin actions, all sigmoid to [0, 1]
+        return torch.sigmoid(action_mean)
 
 
 def export_to_onnx(
@@ -38,7 +29,9 @@ def export_to_onnx(
 
     policy = FishPolicy()
 
-    if "model_state_dict" in checkpoint:
+    if "policy_state_dict" in checkpoint:
+        policy.load_state_dict(checkpoint["policy_state_dict"])
+    elif "model_state_dict" in checkpoint:
         policy.load_state_dict(checkpoint["model_state_dict"])
     elif "policy" in checkpoint:
         policy.load_state_dict(checkpoint["policy"])
@@ -50,7 +43,7 @@ def export_to_onnx(
     export_model = PolicyForExport(policy)
     export_model.eval()
 
-    dummy_input = torch.randn(1, 56)
+    dummy_input = torch.randn(3, 60)  # Fixed batch size of 3 fish
 
     torch.onnx.export(
         export_model,
@@ -61,10 +54,6 @@ def export_to_onnx(
         do_constant_folding=True,
         input_names=["observation"],
         output_names=["action"],
-        dynamic_axes={
-            "observation": {0: "batch_size"},
-            "action": {0: "batch_size"},
-        },
     )
 
     print(f"Exported model to {output_path}")

@@ -12,3 +12,11 @@ i used three claude code instances:
 
 i'm quite happy with what it made thus far. 
 
+to run, `cd src/build` then `python -m http.server 8000`:
+```
+git clone https://github.com/dalongbao/enten
+cd enten/src/build
+python -m http.server 8000
+```
+
+then you should see it on `http://localhost:8000` rendered completey in browser!

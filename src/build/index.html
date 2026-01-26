@@ -11,10 +11,141 @@ html, body { width: 100%; height: 100%; overflow: hidden; background: #0a2a1a; }
 </head>
 <body>
 <canvas id="canvas"></canvas>
+<!-- ONNX Runtime Web -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
 <script>
+// Neural network brain
+let brain = null;
+let obsBuffer = null;
+const OBS_C_SIZE = 56;  // C code provides 56 observations
+const OBS_FULL_SIZE = 60;  // Model expects 60 (56 + 4 social)
+
+async function initBrain() {
+  try {
+    brain = await ort.InferenceSession.create('model.onnx', {
+      executionProviders: ['webgl', 'wasm'],
+      graphOptimizationLevel: 'all',
+    });
+    console.log('Neural network loaded');
+    console.log('  Inputs:', brain.inputNames);
+    console.log('  Outputs:', brain.outputNames);
+
+    // Allocate observation buffer in WASM memory
+    obsBuffer = Module._malloc(OBS_C_SIZE * 4);  // 56 floats
+
+    // Enable neural mode in C
+    Module._set_neural_mode(1);
+  } catch (e) {
+    console.warn('Failed to load neural network, using default behavior:', e);
+  }
+}
+
+// Compute social features for a fish (4 floats: nearest_dist, nearest_angle, num_nearby, heading_diff)
+function computeSocialFeatures(fishId, fishCount, w, h) {
+  const fx = Module._get_fish_x(fishId);
+  const fy = Module._get_fish_y(fishId);
+  const fa = Module._get_fish_angle(fishId);
+
+  let nearestDist = 1.0;  // Normalized (1.0 = far)
+  let nearestAngle = 0.0;
+  let numNearby = 0;
+  let headingDiff = 0.0;
+  const nearbyThreshold = 200;
+
+  for (let j = 0; j < fishCount; j++) {
+    if (j === fishId) continue;
+    const ox = Module._get_fish_x(j);
+    const oy = Module._get_fish_y(j);
+    const oa = Module._get_fish_angle(j);
+
+    // Handle screen wrapping for distance calc
+    let dx = ox - fx;
+    let dy = oy - fy;
+    if (Math.abs(dx) > w / 2) dx = dx > 0 ? dx - w : dx + w;
+    if (Math.abs(dy) > h / 2) dy = dy > 0 ? dy - h : dy + h;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    if (dist < nearbyThreshold) {
+      numNearby++;
+      headingDiff += Math.cos(oa - fa);  // Average heading alignment
+    }
+
+    const normDist = Math.min(dist / 500, 1.0);
+    if (normDist < nearestDist) {
+      nearestDist = normDist;
+      nearestAngle = Math.atan2(dy, dx) - fa;
+      // Normalize angle to [-pi, pi]
+      while (nearestAngle > Math.PI) nearestAngle -= 2 * Math.PI;
+      while (nearestAngle < -Math.PI) nearestAngle += 2 * Math.PI;
+      nearestAngle /= Math.PI;  // Normalize to [-1, 1]
+    }
+  }
+
+  if (numNearby > 0) headingDiff /= numNearby;
+  const numNearbyNorm = Math.min(numNearby / 5, 1.0);
+
+  return [nearestDist, nearestAngle, numNearbyNorm, headingDiff];
+}
+
+async function runInference() {
+  if (!brain || !obsBuffer) return;
+
+  const fishCount = Module._get_fish_count_sim();
+  if (fishCount !== 3) return;  // Model expects exactly 3 fish
+
+  const w = Module._get_screen_w();
+  const h = Module._get_screen_h();
+
+  // Batch inference for all 3 fish
+  const batchObs = new Float32Array(3 * OBS_FULL_SIZE);
+
+  for (let f = 0; f < 3; f++) {
+    // Get C observations (56 floats)
+    Module._get_fish_observation(f, obsBuffer);
+    const cObs = new Float32Array(Module.HEAPF32.buffer, obsBuffer, OBS_C_SIZE);
+
+    // Copy to batch and add social features
+    const offset = f * OBS_FULL_SIZE;
+    for (let i = 0; i < OBS_C_SIZE; i++) {
+      batchObs[offset + i] = cObs[i];
+    }
+    // Add 4 social features
+    const social = computeSocialFeatures(f, fishCount, w, h);
+    batchObs[offset + 56] = social[0];
+    batchObs[offset + 57] = social[1];
+    batchObs[offset + 58] = social[2];
+    batchObs[offset + 59] = social[3];
+  }
+
+  // Run inference (model expects [3, 60])
+  const inputTensor = new ort.Tensor('float32', batchObs, [3, OBS_FULL_SIZE]);
+  const results = await brain.run({ observation: inputTensor });
+  const actions = results.action.data;
+
+  // Set actions for each fish (scaled down for calmer movement)
+  const SPEED_SCALE = 0.1;
+  for (let f = 0; f < 3; f++) {
+    const offset = f * 6;
+    Module._set_fish_fin_action(
+      f,
+      actions[offset + 0] * SPEED_SCALE,  // body_freq
+      actions[offset + 1] * SPEED_SCALE,  // body_amp
+      actions[offset + 2] * SPEED_SCALE,  // left_pec_freq
+      actions[offset + 3] * SPEED_SCALE,  // left_pec_amp
+      actions[offset + 4] * SPEED_SCALE,  // right_pec_freq
+      actions[offset + 5] * SPEED_SCALE   // right_pec_amp
+    );
+  }
+}
+
 var Module = {
   canvas: document.getElementById('canvas'),
-  onRuntimeInitialized: function() {
+  onRuntimeInitialized: async function() {
+    console.log('WASM initialized');
+    console.log('Fish count:', Module._get_fish_count_sim());
+    console.log('Neural mode:', Module._get_neural_mode());
+    await initBrain();
+    console.log('Neural mode after init:', Module._get_neural_mode());
     requestAnimationFrame(render);
   }
 };
@@ -79,7 +210,11 @@ canvas.addEventListener('click', (e) => {
   }
 });
 
-function render() {
+let frameCount = 0;
+async function render() {
+  // Run neural network inference
+  await runInference();
+
   const w = Module._get_screen_w();
   const h = Module._get_screen_h();
   canvas.width = w;
@@ -89,6 +224,12 @@ function render() {
   ctx.fillRect(0, 0, w, h);
 
   const fishCount = Module._get_fish_count_sim();
+  if (frameCount++ < 5) {
+    console.log('Frame', frameCount, 'fishCount:', fishCount, 'w:', w, 'h:', h);
+    if (fishCount > 0) {
+      console.log('Fish 0 pos:', Module._get_fish_x(0), Module._get_fish_y(0));
+    }
+  }
   const fovArc = Module._get_fov_arc();
   const fovRange = Module._get_fov_range();
 
@@ -138,7 +279,7 @@ function render() {
 
   // Draw food with scatter animation
   const foodCount = Module._get_food_count();
-  const foodSize = 8;
+  const foodSize = 10;
   const now = performance.now();
 
   for (let i = 0; i < foodCount; i++) {

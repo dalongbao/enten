@@ -21,6 +21,13 @@ static float gUrgency = 0.3f;
 static FinAction gFinAction = {0.5f, 0.5f, 0.5f, 0.3f, 0.5f, 0.3f};
 static int gUseFinMode = 0;  // 0 = legacy/boid, 1 = fin-based control
 
+// Per-fish fin actions for neural network control
+static FinAction gFishActions[MAX_FISH] = {
+    [0 ... MAX_FISH-1] = {0.5f, 0.5f, 0.5f, 0.3f, 0.5f, 0.3f}
+};
+
+// Neural network control mode
+static int gNeuralMode = 0;
 
 static EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data);
 static void main_loop(void);
@@ -261,6 +268,37 @@ float get_particle_length(int fish_id, int particle_idx) {
     return 0.0f;
 }
 
+// Neural network observation getter
+EMSCRIPTEN_KEEPALIVE
+void get_fish_observation(int fish_id, float* obs_ptr) {
+    sim_get_obs(&gSim, fish_id, obs_ptr);
+}
+
+// Per-fish fin action setter
+EMSCRIPTEN_KEEPALIVE
+void set_fish_fin_action(int fish_id, float body_freq, float body_amp,
+                         float left_pec_freq, float left_pec_amp,
+                         float right_pec_freq, float right_pec_amp) {
+    if (fish_id >= 0 && fish_id < MAX_FISH) {
+        gFishActions[fish_id].body_freq = body_freq;
+        gFishActions[fish_id].body_amp = body_amp;
+        gFishActions[fish_id].left_pec_freq = left_pec_freq;
+        gFishActions[fish_id].left_pec_amp = left_pec_amp;
+        gFishActions[fish_id].right_pec_freq = right_pec_freq;
+        gFishActions[fish_id].right_pec_amp = right_pec_amp;
+    }
+}
+
+EMSCRIPTEN_KEEPALIVE
+void set_neural_mode(int enabled) {
+    gNeuralMode = enabled;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int get_neural_mode(void) {
+    return gNeuralMode;
+}
+
 static EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data) {
     (void)type; (void)e; (void)data;
 
@@ -287,13 +325,25 @@ static EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data) {
 }
 
 static void main_loop(void) {
-    float actions[MAX_FISH][3];
-    for (int i = 0; i < gSim.fish_count; i++) {
-        actions[i][0] = gSpeed;
-        actions[i][1] = gDirection;
-        actions[i][2] = gUrgency;
+    if (gNeuralMode) {
+        // Neural network control - use per-fish fin actions
+        for (int i = 0; i < gSim.fish_count; i++) {
+            fish_update_fin(&gSim.fish[i], &gFishActions[i], FRAME_DT,
+                           gScreenWidth, gScreenHeight);
+        }
+        sim_step_post(&gSim);
+        sim_eat_food(&gSim, NULL);
+        gSim.step_count++;
+    } else {
+        // Legacy mode
+        float actions[MAX_FISH][3];
+        for (int i = 0; i < gSim.fish_count; i++) {
+            actions[i][0] = gSpeed;
+            actions[i][1] = gDirection;
+            actions[i][2] = gUrgency;
+        }
+        sim_step(&gSim, actions, NULL);
     }
-    sim_step(&gSim, actions, NULL);
 
     for (int i = 0; i < gSim.fish_count; i++) {
         fish_compute_body(&gSim.fish[i]);

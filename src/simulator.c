@@ -1,6 +1,7 @@
 #include "simulator.h"
 #include <stdlib.h>
 #include <math.h>
+#include <time.h>
 
 #define COLLISION_RADIUS 100.0f
 #define SEPARATION_FORCE 300.0f
@@ -8,6 +9,7 @@
 #define BOUNDARY_FORCE 400.0f
 
 void sim_init(Simulation* sim, int width, int height, float dt) {
+    srand((unsigned int)time(NULL));
     sim->screen_width = width;
     sim->screen_height = height;
     sim->dt = dt;
@@ -40,6 +42,12 @@ void sim_step(Simulation* sim, const float actions[][3], int* eaten_out) {
                     sim->screen_width, sim->screen_height);
     }
 
+    sim_step_post(sim);
+    sim_eat_food(sim, eaten_out);
+    sim->step_count++;
+}
+
+void sim_step_post(Simulation* sim) {
     for (int i = 0; i < sim->fish_count; i++) {
         float sep_x = 0.0f, sep_y = 0.0f;
 
@@ -52,7 +60,7 @@ void sim_step(Simulation* sim, const float actions[][3], int* eaten_out) {
 
             if (dist < COLLISION_RADIUS && dist > 0.1f) {
                 float strength = (COLLISION_RADIUS - dist) / COLLISION_RADIUS;
-                strength = strength * strength; // Quadratic falloff
+                strength = strength * strength;
                 sep_x += (dx / dist) * strength * SEPARATION_FORCE;
                 sep_y += (dy / dist) * strength * SEPARATION_FORCE;
             }
@@ -77,9 +85,6 @@ void sim_step(Simulation* sim, const float actions[][3], int* eaten_out) {
     for (int i = 0; i < sim->food_count; i++) {
         sim->food[i].age += sim->dt;
     }
-
-    sim_eat_food(sim, eaten_out);
-    sim->step_count++;
 }
 
 bool sim_add_food(Simulation* sim, float x, float y) {

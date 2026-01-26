@@ -7,18 +7,18 @@ class FishBrain {
 
     async load(modelPath) {
         this.modelPath = modelPath;
-        
+
         try {
             this.session = await ort.InferenceSession.create(modelPath, {
                 executionProviders: ['webgl', 'wasm'],
                 graphOptimizationLevel: 'all',
             });
-            
+
             this.isReady = true;
             console.log(`FishBrain: Model loaded from ${modelPath}`);
             console.log(`  Input: ${this.session.inputNames}`);
             console.log(`  Output: ${this.session.outputNames}`);
-            
+
         } catch (error) {
             console.error('FishBrain: Failed to load model:', error);
             throw error;
@@ -30,20 +30,25 @@ class FishBrain {
             throw new Error('FishBrain: Model not loaded. Call load() first.');
         }
 
-        if (observation.length !== 51) {
-            throw new Error(`FishBrain: Expected 51 observations, got ${observation.length}`);
+        if (observation.length !== 60) {
+            throw new Error(`FishBrain: Expected 60 observations, got ${observation.length}`);
         }
 
-        const inputTensor = new ort.Tensor('float32', observation, [1, 51]);
+        const inputTensor = new ort.Tensor('float32', observation, [1, 60]);
 
         const feeds = { observation: inputTensor };
         const results = await this.session.run(feeds);
 
         const actionData = results.action.data;
-        
+
+        // 6 fin actions: body_freq, body_amp, left_pec_freq, left_pec_amp, right_pec_freq, right_pec_amp
         return {
-            thrust: actionData[0],
-            turn: actionData[1],
+            body_freq: actionData[0],
+            body_amp: actionData[1],
+            left_pec_freq: actionData[2],
+            left_pec_amp: actionData[3],
+            right_pec_freq: actionData[4],
+            right_pec_amp: actionData[5],
         };
     }
 
@@ -52,26 +57,31 @@ class FishBrain {
             throw new Error('FishBrain: Model not loaded. Call load() first.');
         }
 
-        const expectedLength = batchSize * 51;
+        const expectedLength = batchSize * 60;
         if (observations.length !== expectedLength) {
             throw new Error(`FishBrain: Expected ${expectedLength} values, got ${observations.length}`);
         }
 
-        const inputTensor = new ort.Tensor('float32', observations, [batchSize, 51]);
+        const inputTensor = new ort.Tensor('float32', observations, [batchSize, 60]);
 
         const feeds = { observation: inputTensor };
         const results = await this.session.run(feeds);
 
         const actionData = results.action.data;
         const actions = [];
-        
+
         for (let i = 0; i < batchSize; i++) {
+            const offset = i * 6;
             actions.push({
-                thrust: actionData[i * 2],
-                turn: actionData[i * 2 + 1],
+                body_freq: actionData[offset],
+                body_amp: actionData[offset + 1],
+                left_pec_freq: actionData[offset + 2],
+                left_pec_amp: actionData[offset + 3],
+                right_pec_freq: actionData[offset + 4],
+                right_pec_amp: actionData[offset + 5],
             });
         }
-        
+
         return actions;
     }
 

@@ -323,8 +323,6 @@ void fish_compute_body(Fish *fish) {
 
       // Rigidity ramps quadratically, extra rigid at base
       float rigidity = t * t;
-      // if (j < 2)
-      //   rigidity *= 0.1f;
 
       float dist = t * ray_len;
       float wave_phase = s->tail.phase - t * 2.0f - ray_phase_offset;

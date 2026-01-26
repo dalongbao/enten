@@ -45,6 +45,7 @@ typedef struct {
 void sim_init(Simulation* sim, int width, int height, float dt);
 void sim_reset(Simulation* sim);
 void sim_step(Simulation* sim, const float actions[][3], int* eaten_out);
+void sim_step_post(Simulation* sim);
 bool sim_add_food(Simulation* sim, float x, float y);
 int sim_eat_food(Simulation* sim, int* eaten_per_fish);
 void sim_cull_food(Simulation* sim);
