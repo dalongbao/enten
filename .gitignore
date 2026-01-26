@@ -1,12 +1,8 @@
 # Build output
-src/build/
 *.o
-*.wasm
-*.js
-*.html
-!src/shell.html
-!src/renderer.js
-!inference/brain.js
+
+# Keep src/build/ for deployment
+!src/build/
 
 # Python
 __pycache__/
@@ -22,7 +18,7 @@ venv/
 # Training artifacts
 checkpoints/
 logs/
-*.onnx
+# Keep model.onnx in src/build for deployment
 
 # OS files
 .DS_Store
