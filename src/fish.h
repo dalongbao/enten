@@ -2,59 +2,124 @@
 #define FISH_H
 #include <math.h>
 
-#define MAX_FOOD 32
+#define MAX_FOOD 2048
+#define MAX_PARTICLES_PER_FISH 384
+#define NUM_BODY_SEGMENTS 3
+#define NUM_TAIL_RAYS 3
+#define NUM_TAIL_JOINTS 6  // joints per ray (flexible tail)
+#define NUM_FIN_RAYS 2     // rays for pectoral/dorsal fins (2 layers)
+#define NUM_FIN_JOINTS 4   // joints per ray for pectoral/dorsal fins
 
 typedef struct {
     float x;
     float y;
 } Vec2;
 
-// Goldfish variety types
 typedef enum {
-    GOLDFISH_COMMON,    // Balanced, medium speed
-    GOLDFISH_COMET,     // Small fins, fast & agile
-    GOLDFISH_FANCY      // Large fins, slow & graceful
+    GOLDFISH_COMMON,
+    GOLDFISH_COMET,
+    GOLDFISH_FANCY
 } GoldfishVariety;
 
-// Physical parameters - vary by goldfish type
 typedef struct {
-    float body_length;      // Visual length in pixels
-    float fin_area_mult;    // Fin size multiplier (affects thrust & drag)
-    float thrust_coeff;     // Base thrust coefficient
-    float drag_coeff;       // Base drag coefficient
-    float turn_rate;        // Max angular velocity
-    float mass;             // Body mass
+    float body_length;
+    float fin_area_mult;
+    float thrust_coeff;
+    float drag_coeff;
+    float turn_rate;
+    float mass;
 } FishParams;
 
-// Tail animation state (computed from movement, not directly controlled)
 typedef struct {
-    float phase;            // Current oscillation phase [0, 2pi]
-    float frequency;        // Current beat frequency (Hz)
-    float amplitude;        // Current tail swing amplitude
+    float phase;
+    float frequency;
+    float amplitude;
 } TailState;
 
-// Internal homeostasis state (for equilibrium reward)
 typedef struct {
-    float hunger;           // [0, 1] - 0=starving, 1=satiated
-    float stress;           // [0, 1] - 0=calm, 1=panicked
-    float social_comfort;   // [0, 1] - 0=lonely/crowded, 1=comfortable
-    float energy;           // [0, 1] - 0=exhausted, 1=rested
+    float hunger;
+    float stress;
+    float social_comfort;
+    float energy;
 } FishInternalState;
 
-// Dynamic state
+// 6-action fin control inputs
+typedef struct {
+    float body_freq;      // Body wave frequency (0-1) -> maps to 0.5-4.0 Hz
+    float body_amp;       // Body wave amplitude (0-1)
+    float left_pec_freq;  // Left pectoral frequency (0-1)
+    float left_pec_amp;   // Left pectoral amplitude (0-1)
+    float right_pec_freq; // Right pectoral frequency (0-1)
+    float right_pec_amp;  // Right pectoral amplitude (0-1)
+} FinAction;
+
+// Particle for trail effects (brushstroke style)
+typedef struct {
+    Vec2 pos;
+    Vec2 prev_pos;   // Previous position for brushstroke trail
+    Vec2 vel;
+    float life;      // 0-1, decreases over time
+    float size;      // Width of brushstroke
+    float length;    // Length of brushstroke
+    float alpha;     // Transparency
+    float angle;     // Orientation angle
+} Particle;
+
+// Particle system per fish
+typedef struct {
+    Particle particles[MAX_PARTICLES_PER_FISH];
+    int count;
+    float emit_timer;
+} ParticleSystem;
+
+// Body: 3 segments (trapezium -> rectangle -> triangle)
+typedef struct {
+    float lengths[NUM_BODY_SEGMENTS];      // 4:3:2 ratio
+    float widths[NUM_BODY_SEGMENTS + 1];   // width at each joint (4 points for 3 segments)
+    Vec2 points[NUM_BODY_SEGMENTS + 1];    // position of each joint
+} BodyState;
+
+// Tail: 3 rays forming 2 fin segments, each ray has multiple joints
+typedef struct {
+    float lengths[NUM_TAIL_RAYS];          // total length: top=70, mid=60, bottom=80
+    float amplitudes[NUM_TAIL_RAYS];       // wave amplitude per ray (bottom > top)
+    Vec2 base;                             // attachment point (same for all rays)
+    Vec2 joints[NUM_TAIL_RAYS][NUM_TAIL_JOINTS];  // joint positions per ray
+} TailFinState;
+
+// Pectoral fins (one on each side) - 2 rays forming 1 fin segment
+typedef struct {
+    float lengths[NUM_FIN_RAYS];      // length per ray
+    float amplitudes[NUM_FIN_RAYS];   // wave amplitude per ray
+    Vec2 base;                         // attachment point on body centerline
+    Vec2 joints[NUM_FIN_RAYS][NUM_FIN_JOINTS];  // joint positions per ray
+    float pressure;                    // pressure from turning (bends the fin)
+} PectoralFin;
+
+// Dorsal fin (on top/back of fish) - 2 rays forming 1 fin segment
+typedef struct {
+    float lengths[NUM_FIN_RAYS];      // length per ray
+    float amplitudes[NUM_FIN_RAYS];   // wave amplitude per ray
+    Vec2 base;                         // attachment point on body centerline
+    Vec2 joints[NUM_FIN_RAYS][NUM_FIN_JOINTS];  // joint positions per ray
+} DorsalFin;
+
 typedef struct {
     Vec2 pos;
     Vec2 vel;
     float angle;
     float angular_vel;
-    float current_speed;        // Actual speed (magnitude of velocity)
+    float current_speed;
     TailState tail;
-    // Animated fin positions (computed from movement)
-    float body_curve;           // Body curvature for rendering [-1, 1]
-    float left_pectoral;        // Left fin angle for rendering
-    float right_pectoral;       // Right fin angle for rendering
-    // Internal state
+    float body_curve;
+    float left_pectoral;
+    float right_pectoral;
     FishInternalState internal;
+    BodyState body;
+    TailFinState tail_fin;
+    PectoralFin pectoral_left;
+    PectoralFin pectoral_right;
+    ParticleSystem particles;
 } FishState;
 
 typedef struct {
@@ -63,28 +128,37 @@ typedef struct {
     GoldfishVariety variety;
 } Fish;
 
-// === Goldfish variety presets ===
-FishParams goldfish_common_params(void);   // Balanced
-FishParams goldfish_comet_params(void);    // Fast & agile
-FishParams goldfish_fancy_params(void);    // Slow & graceful
+FishParams goldfish_common_params(void);
+FishParams goldfish_comet_params(void);
+FishParams goldfish_fancy_params(void);
 
-// === Core functions ===
 Fish fish_create(float x, float y, GoldfishVariety variety);
+void fish_compute_body(Fish* fish);
 
-// New hybrid physics: model outputs speed/direction/urgency
-// Fin animation is computed automatically from movement
+// Legacy action interface (speed/direction/urgency)
 void fish_update(
     Fish* fish,
-    float speed,        // [0, 1] - desired forward speed
-    float direction,    // [-1, 1] - turn rate (-1=left, +1=right)
-    float urgency,      // [0, 1] - movement intensity (affects frequency)
+    float speed,
+    float direction,
+    float urgency,
     float dt,
     int screen_w,
     int screen_h
 );
 
-// === Perception functions ===
-// Cast rays to detect food AOE, output is [distance, intensity] pairs
+// New fin-based action interface (6 actions)
+void fish_update_fin(
+    Fish* fish,
+    const FinAction* action,
+    float dt,
+    int screen_w,
+    int screen_h
+);
+
+// Particle system functions
+void fish_emit_particles(Fish* fish, float dt);
+void fish_update_particles(Fish* fish, float dt);
+
 void fish_cast_rays(
     const Fish* fish,
     const Vec2* food_positions,
@@ -93,29 +167,26 @@ void fish_cast_rays(
     int num_rays,
     float arc_radians,
     float max_distance,
-    float* output  // size: num_rays * 2
+    float* output
 );
 
-// Compute lateral line pressure gradients from nearby food
 void fish_sense_lateral(
     const Fish* fish,
     const Vec2* food_positions,
     const float* food_ages,
     int food_count,
     int num_sensors,
-    float* output  // size: num_sensors * 2
+    float* output
 );
 
-// Get proprioceptive features: [forward_vel, lateral_vel, angular_vel, speed]
 void fish_get_proprioception(
     const Fish* fish,
-    float* output  // size: 4
+    float* output
 );
 
-// Get internal state features: [hunger, stress, social_comfort, energy]
 void fish_get_internal_state(
     const Fish* fish,
-    float* output  // size: 4
+    float* output
 );
 
 #endif

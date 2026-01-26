@@ -1,20 +1,7 @@
 #!/usr/bin/env python3
-"""
-Training script for digital goldfish using PPO.
-
-Supports multi-fish environments with shared policy:
-- Each fish is processed independently by the same network
-- Observations are reshaped from (envs, fish*obs_dim) to (envs*fish, obs_dim)
-- Actions are reshaped back for environment step
-
-Usage:
-    python -m training.train
-    python -m training.train --config training/configs/default.yaml
-    python -m training.train --num-envs 128 --total-timesteps 2000000
-"""
+"""PPO training for digital goldfish. Usage: python -m training.train"""
 
 import argparse
-import os
 import time
 from pathlib import Path
 
@@ -29,7 +16,6 @@ from training.models import FishPolicy
 
 
 def load_config(config_path: str = None) -> dict:
-    """Load configuration from YAML file."""
     default_path = Path(__file__).parent / "configs" / "default.yaml"
     path = Path(config_path) if config_path else default_path
 
@@ -38,7 +24,6 @@ def load_config(config_path: str = None) -> dict:
 
 
 def make_env(config: dict, num_envs: int = None) -> VecFishEnv:
-    """Create vectorized environment."""
     env_config = config.get("env", {})
     n = num_envs or config.get("num_envs", 64)
     return VecFishEnv(num_envs=n, config=env_config)
@@ -52,16 +37,10 @@ def compute_gae(
     gamma: float,
     gae_lambda: float,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Compute Generalized Advantage Estimation.
-
-    Returns:
-        advantages: (num_steps, num_envs)
-        returns: (num_steps, num_envs)
-    """
+    """Compute Generalized Advantage Estimation."""
     num_steps = len(rewards)
     advantages = np.zeros_like(rewards)
-    last_gae = 0
+    last_gae = np.zeros_like(next_value)
 
     for t in reversed(range(num_steps)):
         if t == num_steps - 1:
@@ -69,7 +48,11 @@ def compute_gae(
         else:
             next_val = values[t + 1]
 
-        next_non_terminal = 1.0 - dones[t]
+        if dones.ndim == 2 and rewards.ndim == 3:
+            next_non_terminal = 1.0 - dones[t][:, np.newaxis]
+        else:
+            next_non_terminal = 1.0 - dones[t]
+
         delta = rewards[t] + gamma * next_val * next_non_terminal - values[t]
         advantages[t] = last_gae = delta + gamma * gae_lambda * next_non_terminal * last_gae
 
@@ -78,8 +61,6 @@ def compute_gae(
 
 
 def train(config: dict, args: argparse.Namespace):
-    """Main training loop."""
-    # Device selection: MPS (Mac) > CUDA > CPU
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
@@ -88,31 +69,24 @@ def train(config: dict, args: argparse.Namespace):
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    # Override config with command line args
     num_envs = args.num_envs or config.get("num_envs", 64)
     total_timesteps = args.total_timesteps or config["training"]["total_timesteps"]
 
-    # Create environment
     env = make_env(config, num_envs)
     num_fish = env.num_fish
-    single_obs_dim = env.single_obs_dim  # 60 (per-fish observation)
-    single_action_dim = env.single_action_dim  # 3 (per-fish action)
-    total_obs_dim = num_fish * single_obs_dim
-    total_action_dim = num_fish * single_action_dim
+    single_obs_dim = env.single_obs_dim
+    single_action_dim = env.single_action_dim
     print(f"Created {num_envs} parallel environments with {num_fish} fish each")
     print(f"Per-fish obs dim: {single_obs_dim}, action dim: {single_action_dim}")
 
-    # Create policy (processes single fish observations)
     policy_config = config.get("policy", {})
     policy = FishPolicy(**policy_config).to(device)
     print(f"Policy parameters: {sum(p.numel() for p in policy.parameters()):,}")
 
-    # Optimizer
     ppo_config = config.get("ppo", {})
     lr = ppo_config.get("learning_rate", 3e-4)
     optimizer = optim.Adam(policy.parameters(), lr=lr, eps=1e-5)
 
-    # Training hyperparameters
     num_steps = config["training"]["num_steps"]
     num_minibatches = config["training"]["num_minibatches"]
     update_epochs = config["training"]["update_epochs"]
@@ -124,131 +98,90 @@ def train(config: dict, args: argparse.Namespace):
     max_grad_norm = ppo_config.get("max_grad_norm", 0.5)
     anneal_lr = config["training"].get("anneal_lr", True)
 
-    # Batch sizes (per env, includes all fish)
-    batch_size = num_envs * num_steps
-    minibatch_size = batch_size // num_minibatches
+    samples_per_update = num_envs * num_fish * num_steps
+    minibatch_size = samples_per_update // num_minibatches
 
-    # For policy updates, we process each fish independently
-    # So effective batch size is batch_size * num_fish
-    fish_batch_size = batch_size * num_fish
-    fish_minibatch_size = minibatch_size * num_fish
-
-    # Calculate number of updates
-    num_updates = total_timesteps // batch_size
+    env_steps_per_update = num_envs * num_steps
+    num_updates = total_timesteps // env_steps_per_update
     print(f"Total updates: {num_updates}")
-    print(f"Batch size: {batch_size}, Fish batch size: {fish_batch_size}")
-    print(f"Minibatch size: {minibatch_size}, Fish minibatch size: {fish_minibatch_size}")
+    print(f"Samples per update: {samples_per_update} ({num_envs} envs x {num_fish} fish x {num_steps} steps)")
+    print(f"Minibatch size: {minibatch_size}")
 
-    # Storage for rollout (stores flattened multi-fish data per env)
-    obs_buffer = np.zeros((num_steps, num_envs, total_obs_dim), dtype=np.float32)
-    actions_buffer = np.zeros((num_steps, num_envs, total_action_dim), dtype=np.float32)
-    rewards_buffer = np.zeros((num_steps, num_envs), dtype=np.float32)
+    obs_buffer = np.zeros((num_steps, num_envs, num_fish, single_obs_dim), dtype=np.float32)
+    actions_buffer = np.zeros((num_steps, num_envs, num_fish, single_action_dim), dtype=np.float32)
+    log_probs_buffer = np.zeros((num_steps, num_envs, num_fish), dtype=np.float32)
+    values_buffer = np.zeros((num_steps, num_envs, num_fish), dtype=np.float32)
+    rewards_buffer = np.zeros((num_steps, num_envs, num_fish), dtype=np.float32)
     dones_buffer = np.zeros((num_steps, num_envs), dtype=np.float32)
-    values_buffer = np.zeros((num_steps, num_envs), dtype=np.float32)
-    log_probs_buffer = np.zeros((num_steps, num_envs), dtype=np.float32)
 
-    # Initialize
-    obs, _ = env.reset()
+    obs_flat, _ = env.reset()
     global_step = 0
     start_time = time.time()
 
-    # Logging
     log_interval = config["logging"].get("log_interval", 10)
     save_interval = config["logging"].get("save_interval", 100)
     checkpoint_dir = Path(config["paths"].get("checkpoint_dir", "checkpoints"))
     checkpoint_dir.mkdir(exist_ok=True)
 
     episode_rewards = []
-    episode_lengths = []
 
     for update in range(1, num_updates + 1):
-        # Anneal learning rate
         if anneal_lr:
             frac = 1.0 - (update - 1) / num_updates
             lr_now = lr * frac
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr_now
 
-        # Collect rollout
         for step in range(num_steps):
             global_step += num_envs
 
+            obs = obs_flat.reshape(num_envs, num_fish, single_obs_dim)
             obs_buffer[step] = obs
 
-            # Reshape obs for policy: (num_envs, num_fish * obs_dim) -> (num_envs * num_fish, obs_dim)
-            obs_reshaped = obs.reshape(num_envs * num_fish, single_obs_dim)
-            obs_tensor = torch.from_numpy(obs_reshaped).to(device)
+            obs_for_policy = obs.reshape(num_envs * num_fish, single_obs_dim)
+            obs_tensor = torch.from_numpy(obs_for_policy).to(device)
 
             with torch.no_grad():
                 action, log_prob, _, value = policy.get_action(obs_tensor)
-                # action: (num_envs * num_fish, 3)
-                # log_prob: (num_envs * num_fish,)
-                # value: (num_envs * num_fish, 1)
 
-                action = action.cpu().numpy()
-                log_prob = log_prob.cpu().numpy()
-                value = value.cpu().numpy().squeeze(-1)
+            action_np = action.cpu().numpy().reshape(num_envs, num_fish, single_action_dim)
+            log_prob_np = log_prob.cpu().numpy().reshape(num_envs, num_fish)
+            value_np = value.cpu().numpy().squeeze(-1).reshape(num_envs, num_fish)
 
-            # Reshape action back: (num_envs * num_fish, 3) -> (num_envs, num_fish * 3)
-            action_for_env = action.reshape(num_envs, total_action_dim)
+            actions_buffer[step] = action_np
+            log_probs_buffer[step] = log_prob_np
+            values_buffer[step] = value_np
 
-            # Aggregate log_prob and value across fish (sum log_probs, mean values)
-            log_prob_per_env = log_prob.reshape(num_envs, num_fish).sum(axis=1)
-            value_per_env = value.reshape(num_envs, num_fish).mean(axis=1)
+            action_for_env = action_np.reshape(num_envs, num_fish * single_action_dim)
 
-            actions_buffer[step] = action_for_env
-            log_probs_buffer[step] = log_prob_per_env
-            values_buffer[step] = value_per_env
-
-            # Step environment
-            obs, reward, terminated, truncated, info = env.step(action_for_env)
+            obs_flat, reward, terminated, truncated, info = env.step(action_for_env)
             done = terminated | truncated
 
-            rewards_buffer[step] = reward
+            rewards_buffer[step] = reward[:, np.newaxis] / num_fish
             dones_buffer[step] = done
 
-            # Track episode stats
             if reward.sum() > 0:
                 episode_rewards.extend([r for r in reward if r > 0])
 
-        # Compute GAE
         with torch.no_grad():
-            obs_reshaped = obs.reshape(num_envs * num_fish, single_obs_dim)
-            next_value = policy.get_value(torch.from_numpy(obs_reshaped).to(device))
-            next_value = next_value.cpu().numpy().squeeze(-1)
-            # Aggregate across fish
-            next_value = next_value.reshape(num_envs, num_fish).mean(axis=1)
+            obs = obs_flat.reshape(num_envs, num_fish, single_obs_dim)
+            obs_for_policy = obs.reshape(num_envs * num_fish, single_obs_dim)
+            next_value = policy.get_value(torch.from_numpy(obs_for_policy).to(device))
+            next_value = next_value.cpu().numpy().squeeze(-1).reshape(num_envs, num_fish)
 
         advantages, returns = compute_gae(
             rewards_buffer, values_buffer, dones_buffer, next_value, gamma, gae_lambda
         )
 
-        # For PPO update, we need per-fish data
-        # Reshape obs: (num_steps, num_envs, num_fish * obs_dim) -> (num_steps * num_envs * num_fish, obs_dim)
-        b_obs = obs_buffer.reshape(num_steps, num_envs, num_fish, single_obs_dim)
-        b_obs = b_obs.reshape(-1, single_obs_dim)
+        b_obs = obs_buffer.reshape(-1, single_obs_dim)
+        b_actions = actions_buffer.reshape(-1, single_action_dim)
+        b_log_probs = log_probs_buffer.reshape(-1)
+        b_advantages = advantages.reshape(-1)
+        b_returns = returns.reshape(-1)
 
-        # Reshape actions: (num_steps, num_envs, num_fish * 3) -> (num_steps * num_envs * num_fish, 3)
-        b_actions = actions_buffer.reshape(num_steps, num_envs, num_fish, single_action_dim)
-        b_actions = b_actions.reshape(-1, single_action_dim)
-
-        # For advantages/returns/log_probs/values, replicate for each fish
-        # (num_steps, num_envs) -> (num_steps, num_envs, num_fish) -> (num_steps * num_envs * num_fish,)
-        b_log_probs_per_env = log_probs_buffer.reshape(-1)  # (num_steps * num_envs,)
-        b_advantages = advantages.reshape(-1)  # (num_steps * num_envs,)
-        b_returns = returns.reshape(-1)  # (num_steps * num_envs,)
-        b_values = values_buffer.reshape(-1)  # (num_steps * num_envs,)
-
-        # Replicate per-env values for each fish
-        b_advantages = np.repeat(b_advantages, num_fish)  # (num_steps * num_envs * num_fish,)
-        b_returns = np.repeat(b_returns, num_fish)
-        b_log_probs = np.repeat(b_log_probs_per_env / num_fish, num_fish)  # Distribute log_prob
-
-        # Normalize advantages
         b_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
-        # PPO update (over fish-level batches)
-        b_inds = np.arange(fish_batch_size)
+        b_inds = np.arange(samples_per_update)
         clip_fracs = []
         pg_losses = []
         vf_losses = []
@@ -257,8 +190,8 @@ def train(config: dict, args: argparse.Namespace):
         for _ in range(update_epochs):
             np.random.shuffle(b_inds)
 
-            for start in range(0, fish_batch_size, fish_minibatch_size):
-                end = start + fish_minibatch_size
+            for start in range(0, samples_per_update, minibatch_size):
+                end = start + minibatch_size
                 mb_inds = b_inds[start:end]
 
                 mb_obs = torch.from_numpy(b_obs[mb_inds]).to(device)
@@ -267,11 +200,9 @@ def train(config: dict, args: argparse.Namespace):
                 mb_advantages = torch.from_numpy(b_advantages[mb_inds]).to(device)
                 mb_returns = torch.from_numpy(b_returns[mb_inds]).to(device)
 
-                # Forward pass
                 new_log_prob, entropy, new_value = policy.evaluate_actions(mb_obs, mb_actions)
                 new_value = new_value.squeeze(-1)
 
-                # Policy loss
                 log_ratio = new_log_prob - mb_log_probs
                 ratio = log_ratio.exp()
 
@@ -284,24 +215,19 @@ def train(config: dict, args: argparse.Namespace):
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
                 pg_losses.append(pg_loss.item())
 
-                # Value loss
                 vf_loss = 0.5 * ((new_value - mb_returns) ** 2).mean()
                 vf_losses.append(vf_loss.item())
 
-                # Entropy loss
                 ent_loss = entropy.mean()
                 ent_losses.append(ent_loss.item())
 
-                # Total loss
                 loss = pg_loss - ent_coef * ent_loss + vf_coef * vf_loss
 
-                # Backward pass
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
                 optimizer.step()
 
-        # Logging
         if update % log_interval == 0:
             elapsed = time.time() - start_time
             fps = global_step / elapsed
@@ -318,7 +244,6 @@ def train(config: dict, args: argparse.Namespace):
                 f"Clip {np.mean(clip_fracs):.3f}"
             )
 
-        # Save checkpoint
         if update % save_interval == 0:
             checkpoint_path = checkpoint_dir / f"policy_{update}.pt"
             torch.save(
@@ -332,7 +257,6 @@ def train(config: dict, args: argparse.Namespace):
             )
             print(f"Saved checkpoint: {checkpoint_path}")
 
-    # Save final model
     final_path = checkpoint_dir / "policy_final.pt"
     torch.save(policy.state_dict(), final_path)
     print(f"Training complete! Final model saved to: {final_path}")
@@ -348,14 +272,10 @@ def main():
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     args = parser.parse_args()
 
-    # Set seeds
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
 
-    # Load config
     config = load_config(args.config)
-
-    # Train
     train(config, args)
 
 

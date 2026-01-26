@@ -3,8 +3,70 @@ Created 64 parallel environments with 3 fish each
 Per-fish obs dim: 60, action dim: 3
 Policy parameters: 8,783
 Total updates: 1220
-Batch size: 8192, Fish batch size: 24576
-Minibatch size: 2048, Fish minibatch size: 6144
-Update    10 | Steps    81920 | FPS    258 | Reward 0.231 | PG 0.3174 | VF 1.1565 | Ent 4.3859 | Clip 0.815
-Update    20 | Steps   163840 | FPS    234 | Reward 0.282 | PG 0.3085 | VF 0.3438 | Ent 4.4910 | Clip 0.810
-Update    30 | Steps   245760 | FPS    216 | Reward 0.282 | PG 0.3109 | VF 1.1613 | Ent 4.6303 | Clip 0.809
+Samples per update: 24576 (64 envs x 3 fish x 128 steps)
+Minibatch size: 6144
+Update    10 | Steps    81920 | FPS    267 | Reward 0.293 | PG -0.0001 | VF 0.0516 | Ent 4.2863 | Clip 0.000
+Update    20 | Steps   163840 | FPS    242 | Reward 0.370 | PG -0.0002 | VF 0.0175 | Ent 4.3087 | Clip 0.003
+Update    30 | Steps   245760 | FPS    224 | Reward 0.370 | PG -0.0001 | VF 0.0394 | Ent 4.3509 | Clip 0.003
+Update    40 | Steps   327680 | FPS    233 | Reward 0.342 | PG -0.0004 | VF 0.0241 | Ent 4.3912 | Clip 0.005
+Update    50 | Steps   409600 | FPS    228 | Reward 0.341 | PG -0.0003 | VF 0.0154 | Ent 4.4101 | Clip 0.001
+Update    60 | Steps   491520 | FPS    224 | Reward 0.341 | PG -0.0002 | VF 0.0398 | Ent 4.4394 | Clip 0.000
+Update    70 | Steps   573440 | FPS    228 | Reward 0.332 | PG -0.0003 | VF 0.0164 | Ent 4.4699 | Clip 0.000
+Update    80 | Steps   655360 | FPS    223 | Reward 0.283 | PG -0.0006 | VF 0.0145 | Ent 4.5074 | Clip 0.013
+Update    90 | Steps   737280 | FPS    224 | Reward 0.283 | PG -0.0003 | VF 0.0382 | Ent 4.5656 | Clip 0.000
+Update   100 | Steps   819200 | FPS    226 | Reward 0.264 | PG -0.0006 | VF 0.0154 | Ent 4.6059 | Clip 0.007
+Saved checkpoint: checkpoints/policy_100.pt
+Update   110 | Steps   901120 | FPS    221 | Reward 0.273 | PG 0.0007 | VF 0.9884 | Ent 4.6521 | Clip 0.002
+Update   120 | Steps   983040 | FPS    224 | Reward 0.273 | PG -0.0001 | VF 0.0302 | Ent 4.6770 | Clip 0.000
+Update   130 | Steps  1064960 | FPS    224 | Reward 0.273 | PG -0.0003 | VF 0.0082 | Ent 4.7237 | Clip 0.002
+Update   140 | Steps  1146880 | FPS    220 | Reward 0.273 | PG -0.0005 | VF 0.0302 | Ent 4.7762 | Clip 0.009
+Update   150 | Steps  1228800 | FPS    223 | Reward 0.331 | PG -0.0001 | VF 0.0166 | Ent 4.8135 | Clip 0.000
+Update   160 | Steps  1310720 | FPS    222 | Reward 0.359 | PG -0.0006 | VF 0.0074 | Ent 4.8390 | Clip 0.012
+Update   170 | Steps  1392640 | FPS    221 | Reward 0.359 | PG -0.0003 | VF 0.0361 | Ent 4.8663 | Clip 0.003
+Update   180 | Steps  1474560 | FPS    223 | Reward 0.320 | PG -0.0003 | VF 0.0140 | Ent 4.9006 | Clip 0.001
+Update   190 | Steps  1556480 | FPS    222 | Reward 0.311 | PG -0.0003 | VF 0.0133 | Ent 4.9253 | Clip 0.002
+Update   200 | Steps  1638400 | FPS    221 | Reward 0.311 | PG -0.0001 | VF 0.0246 | Ent 4.9581 | Clip 0.000
+Saved checkpoint: checkpoints/policy_200.pt
+Update   210 | Steps  1720320 | FPS    222 | Reward 0.379 | PG -0.0002 | VF 0.0091 | Ent 4.9965 | Clip 0.002
+Update   220 | Steps  1802240 | FPS    220 | Reward 0.291 | PG -0.0004 | VF 0.0131 | Ent 5.0184 | Clip 0.013
+Update   230 | Steps  1884160 | FPS    221 | Reward 0.291 | PG -0.0002 | VF 0.0198 | Ent 5.0392 | Clip 0.000
+Update   240 | Steps  1966080 | FPS    221 | Reward 0.206 | PG -0.0002 | VF 0.0069 | Ent 5.0651 | Clip 0.000
+Update   250 | Steps  2048000 | FPS    219 | Reward 0.206 | PG 0.0002 | VF 0.9895 | Ent 5.0930 | Clip 0.018
+Update   260 | Steps  2129920 | FPS    221 | Reward 0.322 | PG -0.0003 | VF 0.0181 | Ent 5.1061 | Clip 0.004
+Update   270 | Steps  2211840 | FPS    220 | Reward 0.302 | PG -0.0002 | VF 0.0080 | Ent 5.1314 | Clip 0.004
+Update   280 | Steps  2293760 | FPS    219 | Reward 0.302 | PG -0.0002 | VF 0.0181 | Ent 5.1540 | Clip 0.004
+Update   290 | Steps  2375680 | FPS    221 | Reward 0.282 | PG -0.0000 | VF 0.0094 | Ent 5.1823 | Clip 0.000
+Update   300 | Steps  2457600 | FPS    220 | Reward 0.399 | PG -0.0008 | VF 0.0091 | Ent 5.2072 | Clip 0.016
+Saved checkpoint: checkpoints/policy_300.pt
+Update   310 | Steps  2539520 | FPS    220 | Reward 0.399 | PG -0.0001 | VF 0.0170 | Ent 5.2304 | Clip 0.002
+Update   320 | Steps  2621440 | FPS    220 | Reward 0.292 | PG -0.0003 | VF 0.0081 | Ent 5.2621 | Clip 0.000
+Update   330 | Steps  2703360 | FPS    220 | Reward 0.263 | PG -0.0002 | VF 0.0159 | Ent 5.2916 | Clip 0.006
+Update   340 | Steps  2785280 | FPS    220 | Reward 0.263 | PG -0.0003 | VF 0.0146 | Ent 5.3141 | Clip 0.000
+Update   350 | Steps  2867200 | FPS    220 | Reward 0.350 | PG -0.0002 | VF 0.0067 | Ent 5.3448 | Clip 0.000
+Update   360 | Steps  2949120 | FPS    219 | Reward 0.389 | PG 0.0011 | VF 1.1604 | Ent 5.3787 | Clip 0.049
+Update   370 | Steps  3031040 | FPS    220 | Reward 0.389 | PG -0.0003 | VF 0.0133 | Ent 5.4232 | Clip 0.007
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/Users/rtty/enten/training/train.py", line 359, in <module>
+    main()
+  File "/Users/rtty/enten/training/train.py", line 355, in main
+    train(config, args)
+  File "/Users/rtty/enten/training/train.py", line 265, in train
+    new_log_prob, entropy, new_value = policy.evaluate_actions(mb_obs, mb_actions)
+                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/rtty/enten/training/models/policy.py", line 233, in evaluate_actions
+    dist = Normal(action_mean, std)
+           ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/rtty/.pyenv/versions/3.12.0/lib/python3.12/site-packages/torch/distributions/normal.py", line 59, in __init__
+    super().__init__(batch_shape, validate_args=validate_args)
+  File "/Users/rtty/.pyenv/versions/3.12.0/lib/python3.12/site-packages/torch/distributions/distribution.py", line 71, in __init__
+    raise ValueError(
+ValueError: Expected parameter loc (Tensor of shape (6144, 3)) of distribution Normal(loc: torch.Size([6144, 3]), scale: torch.Size([6144, 3])) to satisfy the constraint Real(), but found invalid values:
+tensor([[nan, nan, nan],
+        [nan, nan, nan],
+        [nan, nan, nan],
+        ...,
+        [nan, nan, nan],
+        [nan, nan, nan],
+        [nan, nan, nan]], device='mps:0', grad_fn=<LinearBackward0>)
