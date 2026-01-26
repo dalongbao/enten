@@ -35,3 +35,5 @@ logs/
 # Claude Code local settings
 claude.md
 .claude/settings.local.json
+*/.claude
+.claude
