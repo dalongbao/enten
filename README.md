@@ -10,7 +10,7 @@ i used three claude code instances:
 2. RL environment
 3. simulation and rendering
 
-i'm quite happy with what it made thus far. 
+i'm quite happy with what it made thus far. trained using [pufferlib](https://github.com/pufferai/pufferlib)
 
 to run, `cd src/build` then `python -m http.server 8000`:
 ```
