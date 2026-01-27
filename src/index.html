@@ -1,0 +1,560 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>goldfish</title>
+<style>
+* { margin: 0; padding: 0; }
+html, body { width: 100%; height: 100%; overflow: hidden; background: #000000; }
+#canvas { display: block; }
+</style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<!-- ONNX Runtime Web -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.17.0/dist/ort.min.js"></script>
+<script>
+// Neural network brain
+let brain = null;
+let obsBuffer = null;
+const OBS_C_SIZE = 56;  // C code provides 56 observations
+const OBS_FULL_SIZE = 60;  // Model expects 60 (56 + 4 social)
+
+async function initBrain() {
+  try {
+    brain = await ort.InferenceSession.create('model.onnx', {
+      executionProviders: ['webgl', 'wasm'],
+      graphOptimizationLevel: 'all',
+    });
+    console.log('Neural network loaded');
+    console.log('  Inputs:', brain.inputNames);
+    console.log('  Outputs:', brain.outputNames);
+
+    // Allocate observation buffer in WASM memory
+    obsBuffer = Module._malloc(OBS_C_SIZE * 4);  // 56 floats
+
+    // Enable neural mode in C
+    Module._set_neural_mode(1);
+  } catch (e) {
+    console.warn('Failed to load neural network, using default behavior:', e);
+  }
+}
+
+// Compute social features for a fish (4 floats: nearest_dist, nearest_angle, num_nearby, heading_diff)
+function computeSocialFeatures(fishId, fishCount, w, h) {
+  const fx = Module._get_fish_x(fishId);
+  const fy = Module._get_fish_y(fishId);
+  const fa = Module._get_fish_angle(fishId);
+
+  let nearestDist = 1.0;  // Normalized (1.0 = far)
+  let nearestAngle = 0.0;
+  let numNearby = 0;
+  let headingDiff = 0.0;
+  const nearbyThreshold = 200;
+
+  for (let j = 0; j < fishCount; j++) {
+    if (j === fishId) continue;
+    const ox = Module._get_fish_x(j);
+    const oy = Module._get_fish_y(j);
+    const oa = Module._get_fish_angle(j);
+
+    // Handle screen wrapping for distance calc
+    let dx = ox - fx;
+    let dy = oy - fy;
+    if (Math.abs(dx) > w / 2) dx = dx > 0 ? dx - w : dx + w;
+    if (Math.abs(dy) > h / 2) dy = dy > 0 ? dy - h : dy + h;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+
+    if (dist < nearbyThreshold) {
+      numNearby++;
+      headingDiff += Math.cos(oa - fa);  // Average heading alignment
+    }
+
+    const normDist = Math.min(dist / 500, 1.0);
+    if (normDist < nearestDist) {
+      nearestDist = normDist;
+      nearestAngle = Math.atan2(dy, dx) - fa;
+      // Normalize angle to [-pi, pi]
+      while (nearestAngle > Math.PI) nearestAngle -= 2 * Math.PI;
+      while (nearestAngle < -Math.PI) nearestAngle += 2 * Math.PI;
+      nearestAngle /= Math.PI;  // Normalize to [-1, 1]
+    }
+  }
+
+  if (numNearby > 0) headingDiff /= numNearby;
+  const numNearbyNorm = Math.min(numNearby / 5, 1.0);
+
+  return [nearestDist, nearestAngle, numNearbyNorm, headingDiff];
+}
+
+async function runInference() {
+  if (!brain || !obsBuffer) return;
+
+  const fishCount = Module._get_fish_count_sim();
+  if (fishCount !== 3) return;  // Model expects exactly 3 fish
+
+  const w = Module._get_screen_w();
+  const h = Module._get_screen_h();
+
+  // Batch inference for all 3 fish
+  const batchObs = new Float32Array(3 * OBS_FULL_SIZE);
+
+  for (let f = 0; f < 3; f++) {
+    // Get C observations (56 floats)
+    Module._get_fish_observation(f, obsBuffer);
+    const cObs = new Float32Array(Module.HEAPF32.buffer, obsBuffer, OBS_C_SIZE);
+
+    // Copy to batch and add social features
+    const offset = f * OBS_FULL_SIZE;
+    for (let i = 0; i < OBS_C_SIZE; i++) {
+      batchObs[offset + i] = cObs[i];
+    }
+    // Add 4 social features
+    const social = computeSocialFeatures(f, fishCount, w, h);
+    batchObs[offset + 56] = social[0];
+    batchObs[offset + 57] = social[1];
+    batchObs[offset + 58] = social[2];
+    batchObs[offset + 59] = social[3];
+  }
+
+  // Run inference (model expects [3, 60])
+  const inputTensor = new ort.Tensor('float32', batchObs, [3, OBS_FULL_SIZE]);
+  const results = await brain.run({ observation: inputTensor });
+  const actions = results.action.data;
+
+  // Set actions for each fish (scaled down for calmer movement)
+  const SPEED_SCALE = 0.1;
+  for (let f = 0; f < 3; f++) {
+    const offset = f * 6;
+    Module._set_fish_fin_action(
+      f,
+      actions[offset + 0] * SPEED_SCALE,  // body_freq
+      actions[offset + 1] * SPEED_SCALE,  // body_amp
+      actions[offset + 2] * SPEED_SCALE,  // left_pec_freq
+      actions[offset + 3] * SPEED_SCALE,  // left_pec_amp
+      actions[offset + 4] * SPEED_SCALE,  // right_pec_freq
+      actions[offset + 5] * SPEED_SCALE   // right_pec_amp
+    );
+  }
+}
+
+var Module = {
+  canvas: document.getElementById('canvas'),
+  onRuntimeInitialized: async function() {
+    console.log('WASM initialized');
+    console.log('Fish count:', Module._get_fish_count_sim());
+    console.log('Neural mode:', Module._get_neural_mode());
+    await initBrain();
+    console.log('Neural mode after init:', Module._get_neural_mode());
+    requestAnimationFrame(render);
+  }
+};
+</script>
+<script src="index.js"></script>
+<script>
+const canvas = document.getElementById('canvas');
+const ctx = canvas.getContext('2d');
+
+// Settings
+const SHOW_TRAILS = false;  // Set to false to disable trails
+const SHOW_FOV = false;      // Set to false to disable FOV visualization
+const GHOST_MARGIN = 150;    // Distance from edge to start ghost rendering
+
+// Preload food images
+const foodImages = [];
+const foodImageSrcs = [
+  'aja.png', 'gpt.png', 'gemini.png', 'claude.png', 'sbr.png', 'uu.png'
+];
+foodImageSrcs.forEach(src => {
+  const img = new Image();
+  img.src = src;
+  foodImages.push(img);
+});
+
+// Track which image each food uses
+const foodImageMap = new Map();
+let foodIdCounter = 0;
+
+// Track food animations (scatter effect)
+const foodAnimations = new Map();
+const SCATTER_DURATION = 300; // ms
+
+// Click to scatter food pellets with animation
+canvas.addEventListener('click', (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const cx = e.clientX - rect.left;
+  const cy = e.clientY - rect.top;
+  const scatterRadius = 100;
+  const pelletCount = 16;
+  const spawnTime = performance.now();
+
+  for (let i = 0; i < pelletCount; i++) {
+    // Random target position within circle
+    const angle = Math.random() * Math.PI * 2;
+    const dist = Math.random() * scatterRadius;
+    const targetX = cx + Math.cos(angle) * dist;
+    const targetY = cy + Math.sin(angle) * dist;
+
+    // Store animation data
+    const foodId = foodIdCounter++;
+    foodImageMap.set(foodId, Math.floor(Math.random() * foodImages.length));
+    foodAnimations.set(foodId, {
+      startX: cx,
+      startY: cy,
+      targetX: targetX,
+      targetY: targetY,
+      spawnTime: spawnTime
+    });
+
+    Module._spawn_food(targetX, targetY);
+  }
+});
+
+let frameCount = 0;
+async function render() {
+  // Run neural network inference
+  await runInference();
+
+  const w = Module._get_screen_w();
+  const h = Module._get_screen_h();
+  canvas.width = w;
+  canvas.height = h;
+
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, w, h);
+
+  const fishCount = Module._get_fish_count_sim();
+  if (frameCount++ < 5) {
+    console.log('Frame', frameCount, 'fishCount:', fishCount, 'w:', w, 'h:', h);
+    if (fishCount > 0) {
+      console.log('Fish 0 pos:', Module._get_fish_x(0), Module._get_fish_y(0));
+    }
+  }
+  const fovArc = Module._get_fov_arc();
+  const fovRange = Module._get_fov_range();
+
+  // Draw FOV sensing cones (behind everything) with ghost rendering
+  if (SHOW_FOV) for (let f = 0; f < fishCount; f++) {
+    const fx = Module._get_fish_x(f);
+    const fy = Module._get_fish_y(f);
+    const angle = Module._get_fish_angle(f);
+
+    // Determine ghost positions
+    const fovOffsets = [[0, 0]];
+    const nearLeft = fx < GHOST_MARGIN;
+    const nearRight = fx > w - GHOST_MARGIN;
+    const nearTop = fy < GHOST_MARGIN;
+    const nearBottom = fy > h - GHOST_MARGIN;
+    if (nearLeft) fovOffsets.push([w, 0]);
+    if (nearRight) fovOffsets.push([-w, 0]);
+    if (nearTop) fovOffsets.push([0, h]);
+    if (nearBottom) fovOffsets.push([0, -h]);
+    if (nearLeft && nearTop) fovOffsets.push([w, h]);
+    if (nearLeft && nearBottom) fovOffsets.push([w, -h]);
+    if (nearRight && nearTop) fovOffsets.push([-w, h]);
+    if (nearRight && nearBottom) fovOffsets.push([-w, -h]);
+
+    for (const [ox, oy] of fovOffsets) {
+      const gx = fx + ox;
+      const gy = fy + oy;
+
+      // Draw sensing cone as gradient arc
+      const startAngle = angle - fovArc / 2;
+      const endAngle = angle + fovArc / 2;
+
+      // Radial gradient from fish position
+      const gradient = ctx.createRadialGradient(gx, gy, 0, gx, gy, fovRange);
+      gradient.addColorStop(0, 'rgba(60, 100, 80, 0.15)');
+      gradient.addColorStop(0.7, 'rgba(40, 80, 60, 0.08)');
+      gradient.addColorStop(1, 'rgba(30, 60, 50, 0)');
+
+      ctx.fillStyle = gradient;
+      ctx.beginPath();
+      ctx.moveTo(gx, gy);
+      ctx.arc(gx, gy, fovRange, startAngle, endAngle);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  // Draw food with scatter animation
+  const foodCount = Module._get_food_count();
+  const foodSize = 10;
+  const now = performance.now();
+
+  for (let i = 0; i < foodCount; i++) {
+    const targetX = Module._get_food_x(i);
+    const targetY = Module._get_food_y(i);
+
+    // Check for animation
+    const anim = foodAnimations.get(i);
+    let fx = targetX, fy = targetY, scale = 1;
+
+    if (anim) {
+      const elapsed = now - anim.spawnTime;
+      if (elapsed < SCATTER_DURATION) {
+        // Ease-out animation
+        const t = elapsed / SCATTER_DURATION;
+        const ease = 1 - Math.pow(1 - t, 3); // cubic ease-out
+        fx = anim.startX + (anim.targetX - anim.startX) * ease;
+        fy = anim.startY + (anim.targetY - anim.startY) * ease;
+        // Scale up from 0 to 1
+        scale = ease;
+      } else {
+        // Animation complete, clean up
+        foodAnimations.delete(i);
+      }
+    }
+
+    // Get image for this food
+    const imgIdx = foodImageMap.get(i) ?? (i % foodImages.length);
+    const img = foodImages[imgIdx];
+    const drawSize = foodSize * scale;
+
+    if (drawSize > 0.5) {
+      if (img.complete && img.naturalWidth > 0) {
+        ctx.drawImage(img, fx - drawSize/2, fy - drawSize/2, drawSize, drawSize);
+      } else {
+        // Fallback circle if image not loaded
+        ctx.fillStyle = '#90ee90';
+        ctx.beginPath();
+        ctx.arc(fx, fy, drawSize/2, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+  }
+
+  const numSegments = Module._get_num_body_segments();
+  const numTailRays = Module._get_num_tail_rays();
+  const numTailJoints = Module._get_num_tail_joints();
+  const numFinRays = Module._get_num_fin_rays();
+  const numFinJoints = Module._get_num_fin_joints();
+
+  // Function to draw a fish with offset (for ghost rendering)
+  function drawFish(f, offsetX, offsetY) {
+    // Get body points and widths
+    const body = [];
+    for (let i = 0; i <= numSegments; i++) {
+      body.push({
+        x: Module._get_body_point_x(f, i) + offsetX,
+        y: Module._get_body_point_y(f, i) + offsetY,
+        w: Module._get_body_width(f, i)
+      });
+    }
+
+    // Get tail ray joints (3 rays)
+    const tailRays = [];
+    for (let r = 0; r < numTailRays; r++) {
+      const joints = [];
+      for (let j = 0; j < numTailJoints; j++) {
+        joints.push({
+          x: Module._get_tail_joint_x(f, r, j) + offsetX,
+          y: Module._get_tail_joint_y(f, r, j) + offsetY
+        });
+      }
+      tailRays.push(joints);
+    }
+
+    // Get pectoral fin rays (2 rays each)
+    const pecLeftRays = [];
+    const pecRightRays = [];
+    for (let r = 0; r < numFinRays; r++) {
+      const leftJoints = [];
+      const rightJoints = [];
+      for (let j = 0; j < numFinJoints; j++) {
+        leftJoints.push({
+          x: Module._get_pectoral_left_joint_x(f, r, j) + offsetX,
+          y: Module._get_pectoral_left_joint_y(f, r, j) + offsetY
+        });
+        rightJoints.push({
+          x: Module._get_pectoral_right_joint_x(f, r, j) + offsetX,
+          y: Module._get_pectoral_right_joint_y(f, r, j) + offsetY
+        });
+      }
+      pecLeftRays.push(leftJoints);
+      pecRightRays.push(rightJoints);
+    }
+
+    // Draw pectoral fins (behind body) - filled between 2 rays
+    ctx.fillStyle = '#c77c5e';
+
+    // Left pectoral fin
+    ctx.beginPath();
+    ctx.moveTo(pecLeftRays[0][0].x, pecLeftRays[0][0].y);
+    for (let j = 0; j < numFinJoints; j++) {
+      ctx.lineTo(pecLeftRays[0][j].x, pecLeftRays[0][j].y);
+    }
+    for (let j = numFinJoints - 1; j >= 0; j--) {
+      ctx.lineTo(pecLeftRays[1][j].x, pecLeftRays[1][j].y);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // Right pectoral fin
+    ctx.beginPath();
+    ctx.moveTo(pecRightRays[0][0].x, pecRightRays[0][0].y);
+    for (let j = 0; j < numFinJoints; j++) {
+      ctx.lineTo(pecRightRays[0][j].x, pecRightRays[0][j].y);
+    }
+    for (let j = numFinJoints - 1; j >= 0; j--) {
+      ctx.lineTo(pecRightRays[1][j].x, pecRightRays[1][j].y);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // Draw tail fins (behind body)
+
+    // Top fin (between ray 0 and ray 1)
+    ctx.beginPath();
+    ctx.moveTo(tailRays[0][0].x, tailRays[0][0].y);
+    for (let j = 0; j < numTailJoints; j++) {
+      ctx.lineTo(tailRays[0][j].x, tailRays[0][j].y);
+    }
+    for (let j = numTailJoints - 1; j >= 0; j--) {
+      ctx.lineTo(tailRays[1][j].x, tailRays[1][j].y);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // Bottom fin (between ray 1 and ray 2)
+    ctx.beginPath();
+    ctx.moveTo(tailRays[1][0].x, tailRays[1][0].y);
+    for (let j = 0; j < numTailJoints; j++) {
+      ctx.lineTo(tailRays[1][j].x, tailRays[1][j].y);
+    }
+    for (let j = numTailJoints - 1; j >= 0; j--) {
+      ctx.lineTo(tailRays[2][j].x, tailRays[2][j].y);
+    }
+    ctx.closePath();
+    ctx.fill();
+
+    // Draw top ray line in darker red for visibility
+    ctx.strokeStyle = '#8a2a15';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(tailRays[0][0].x, tailRays[0][0].y);
+    for (let j = 1; j < numTailJoints; j++) {
+      ctx.lineTo(tailRays[0][j].x, tailRays[0][j].y);
+    }
+    ctx.stroke();
+
+    // Draw body as one continuous shape
+    ctx.fillStyle = '#CC7C5E';
+    ctx.beginPath();
+
+    // Calculate normals for each segment
+    const normals = [];
+    for (let i = 0; i < numSegments; i++) {
+      const dx = body[i + 1].x - body[i].x;
+      const dy = body[i + 1].y - body[i].y;
+      const len = Math.sqrt(dx * dx + dy * dy) || 1;
+      normals.push({ x: -dy / len, y: dx / len });
+    }
+
+    // Trace one side (head to tail)
+    for (let i = 0; i <= numSegments; i++) {
+      const p = body[i];
+      const bw = p.w / 2;
+      const n = normals[Math.min(i, numSegments - 1)];
+      const x = p.x + n.x * bw;
+      const y = p.y + n.y * bw;
+      if (i === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }
+
+    // Trace other side (tail to head)
+    for (let i = numSegments; i >= 0; i--) {
+      const p = body[i];
+      const bw = p.w / 2;
+      const n = normals[Math.min(i, numSegments - 1)];
+      ctx.lineTo(p.x - n.x * bw, p.y - n.y * bw);
+    }
+
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // Draw continuous flowing trails (black and red)
+  if (SHOW_TRAILS) for (let f = 0; f < fishCount; f++) {
+    const particleCount = Module._get_particle_count(f);
+    if (particleCount < 2) continue;
+
+    // Collect all particle positions sorted by life (oldest first for continuous line)
+    const particles = [];
+    for (let p = 0; p < particleCount; p++) {
+      particles.push({
+        x: Module._get_particle_x(f, p),
+        y: Module._get_particle_y(f, p),
+        alpha: Module._get_particle_alpha(f, p),
+        size: Module._get_particle_size(f, p)
+      });
+    }
+
+    // Draw as continuous flowing line
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+
+    for (let p = 1; p < particles.length; p++) {
+      const prev = particles[p - 1];
+      const curr = particles[p];
+
+      // Skip if points are too far apart (discontinuity)
+      const dx = curr.x - prev.x;
+      const dy = curr.y - prev.y;
+      if (Math.abs(dx) > 100 || Math.abs(dy) > 100) continue;
+
+      // Interpolate between black and deep red based on position in trail
+      const t = p / particles.length;
+      const alpha = curr.alpha * 0.8;
+
+      // Mix: start with deep red, fade to black
+      const r = Math.floor(180 * (1 - t * 0.7));
+      const g = Math.floor(20 * (1 - t));
+      const b = Math.floor(20 * (1 - t));
+
+      ctx.strokeStyle = `rgba(${r},${g},${b},${alpha})`;
+      ctx.lineWidth = curr.size * (1 + t * 0.5);
+
+      ctx.beginPath();
+      ctx.moveTo(prev.x, prev.y);
+      ctx.lineTo(curr.x, curr.y);
+      ctx.stroke();
+    }
+  }
+
+  // Draw all fish with ghost rendering for smooth wrapping
+  for (let f = 0; f < fishCount; f++) {
+    const fx = Module._get_fish_x(f);
+    const fy = Module._get_fish_y(f);
+
+    // Determine which ghost positions to draw
+    const offsets = [[0, 0]]; // Always draw at original position
+
+    // Check edges and add ghost offsets
+    const nearLeft = fx < GHOST_MARGIN;
+    const nearRight = fx > w - GHOST_MARGIN;
+    const nearTop = fy < GHOST_MARGIN;
+    const nearBottom = fy > h - GHOST_MARGIN;
+
+    if (nearLeft) offsets.push([w, 0]);
+    if (nearRight) offsets.push([-w, 0]);
+    if (nearTop) offsets.push([0, h]);
+    if (nearBottom) offsets.push([0, -h]);
+
+    // Corner ghosts (when near two edges)
+    if (nearLeft && nearTop) offsets.push([w, h]);
+    if (nearLeft && nearBottom) offsets.push([w, -h]);
+    if (nearRight && nearTop) offsets.push([-w, h]);
+    if (nearRight && nearBottom) offsets.push([-w, -h]);
+
+    // Draw fish at all positions
+    for (const [ox, oy] of offsets) {
+      drawFish(f, ox, oy);
+    }
+  }
+
+  requestAnimationFrame(render);
+}
+</script>
+</body>
+</html>
