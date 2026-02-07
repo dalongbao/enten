@@ -10,7 +10,8 @@ $(OUT)/index.js: $(SRCS) fish.h simulator.h
 	mkdir -p $(OUT)
 	$(CC) $(CFLAGS) $(SRCS) -o $(OUT)/index.js $(LDFLAGS)
 	cp index.html $(OUT)/
-	-cp media/*.png $(OUT)/ 2>/dev/null || true
+	mkdir -p $(OUT)/media
+	-cp media/*.png $(OUT)/media/ 2>/dev/null || true
 	-cp ../inference/model.onnx $(OUT)/ 2>/dev/null || true
 
 clean:
