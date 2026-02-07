@@ -43,7 +43,6 @@ typedef struct {
     float energy;
 } FishInternalState;
 
-// 6-action fin control inputs
 typedef struct {
     float body_freq;      // Body wave frequency (0-1) -> maps to 0.5-4.0 Hz
     float body_amp;       // Body wave amplitude (0-1)
@@ -65,7 +64,6 @@ typedef struct {
     float angle;     // Orientation angle
 } Particle;
 
-// Particle system per fish
 typedef struct {
     Particle particles[MAX_PARTICLES_PER_FISH];
     int count;
@@ -135,7 +133,6 @@ FishParams goldfish_fancy_params(void);
 Fish fish_create(float x, float y, GoldfishVariety variety);
 void fish_compute_body(Fish* fish);
 
-// Legacy action interface (speed/direction/urgency)
 void fish_update(
     Fish* fish,
     float speed,
@@ -146,7 +143,6 @@ void fish_update(
     int screen_h
 );
 
-// New fin-based action interface (6 actions)
 void fish_update_fin(
     Fish* fish,
     const FinAction* action,
@@ -155,7 +151,6 @@ void fish_update_fin(
     int screen_h
 );
 
-// Particle system functions
 void fish_emit_particles(Fish* fish, float dt);
 void fish_update_particles(Fish* fish, float dt);
 

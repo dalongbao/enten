@@ -1,8 +1,11 @@
 # Build output
 *.o
 
-# Keep src/build/ for deployment
+# Keep src/build/ for deployment (only track generated JS/WASM/HTML)
 !src/build/
+src/build/*.png
+src/build/model.onnx
+src/build/js/
 
 # Python
 __pycache__/
@@ -18,7 +21,8 @@ venv/
 # Training artifacts
 checkpoints/
 logs/
-# Keep model.onnx in src/build for deployment
+*.log
+
 
 # OS files
 .DS_Store

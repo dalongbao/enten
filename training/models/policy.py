@@ -51,7 +51,6 @@ class FishPolicy(nn.Module):
             nn.ReLU(),
         )
 
-        # 6 actions: body_freq, body_amp, left_pec_freq, left_pec_amp, right_pec_freq, right_pec_amp
         self.action_mean = nn.Linear(hidden_dim, 6)
         self.action_log_std = nn.Parameter(torch.zeros(6))
         self.value_head = nn.Linear(hidden_dim, 1)
@@ -109,8 +108,6 @@ class FishPolicy(nn.Module):
             log_prob = dist.log_prob(unbounded_action).sum(dim=-1)
             entropy = dist.entropy().sum(dim=-1)
 
-        # All 6 actions use sigmoid (all in [0, 1] range)
-        # body_freq, body_amp, left_pec_freq, left_pec_amp, right_pec_freq, right_pec_amp
         action = torch.sigmoid(unbounded_action)
 
         return action, log_prob, entropy, value

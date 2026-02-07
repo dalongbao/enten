@@ -32,7 +32,6 @@ static int gNeuralMode = 0;
 static EM_BOOL on_resize(int type, const EmscriptenUiEvent *e, void *data);
 static void main_loop(void);
 
-// Legacy action interface - maps to fin-based internally
 EMSCRIPTEN_KEEPALIVE
 void set_action(float speed, float direction, float urgency) {
     gSpeed = speed;
@@ -41,7 +40,6 @@ void set_action(float speed, float direction, float urgency) {
     gUseFinMode = 0;
 }
 
-// New fin-based action interface (6 actions)
 EMSCRIPTEN_KEEPALIVE
 void set_fin_action(float body_freq, float body_amp,
                     float left_pec_freq, float left_pec_amp,
@@ -212,7 +210,6 @@ float get_pectoral_right_joint_y(int fish_id, int ray_idx, int joint_idx) {
     return 0.0f;
 }
 
-// Particle system accessors
 EMSCRIPTEN_KEEPALIVE
 int get_particle_count(int fish_id) {
     if (fish_id >= 0 && fish_id < gSim.fish_count)
@@ -268,13 +265,11 @@ float get_particle_length(int fish_id, int particle_idx) {
     return 0.0f;
 }
 
-// Neural network observation getter
 EMSCRIPTEN_KEEPALIVE
 void get_fish_observation(int fish_id, float* obs_ptr) {
     sim_get_obs(&gSim, fish_id, obs_ptr);
 }
 
-// Per-fish fin action setter
 EMSCRIPTEN_KEEPALIVE
 void set_fish_fin_action(int fish_id, float body_freq, float body_amp,
                          float left_pec_freq, float left_pec_amp,

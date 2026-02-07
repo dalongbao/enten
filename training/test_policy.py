@@ -14,7 +14,6 @@ from training.models import FishPolicy
 
 
 def render_ascii(env, width=80, height=24):
-    """Simple ASCII render of the environment."""
     # Create empty grid
     grid = [[' ' for _ in range(width)] for _ in range(height)]
 
@@ -33,7 +32,6 @@ def render_ascii(env, width=80, height=24):
     px = int(env.pos[0] * scale_x)
     py = int(env.pos[1] * scale_y)
 
-    # Arrow characters based on angle
     angle = env.angle % (2 * np.pi)
     if angle < np.pi / 8 or angle >= 15 * np.pi / 8:
         fish_char = '→'
@@ -55,7 +53,6 @@ def render_ascii(env, width=80, height=24):
     if 0 <= px < width and 0 <= py < height:
         grid[py][px] = fish_char
 
-    # Draw border and convert to string
     border = '─' * width
     output = ['┌' + border + '┐']
     for row in grid:
@@ -66,8 +63,6 @@ def render_ascii(env, width=80, height=24):
 
 
 def test_policy(checkpoint_path: str, num_episodes: int = 3, render: bool = True):
-    """Test a trained policy."""
-    # Device
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
@@ -76,7 +71,6 @@ def test_policy(checkpoint_path: str, num_episodes: int = 3, render: bool = True
         device = torch.device("cpu")
     print(f"Using device: {device}")
 
-    # Load policy
     policy = FishPolicy()
 
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
@@ -90,7 +84,6 @@ def test_policy(checkpoint_path: str, num_episodes: int = 3, render: bool = True
     policy = policy.to(device)
     policy.eval()
 
-    # Create environment
     env = FishEnv(config={
         'width': 800,
         'height': 600,
@@ -107,19 +100,16 @@ def test_policy(checkpoint_path: str, num_episodes: int = 3, render: bool = True
         print(f"\n=== Episode {ep + 1} ===")
 
         for step in range(500):
-            # Get action
             with torch.no_grad():
                 obs_tensor = torch.from_numpy(obs).unsqueeze(0).to(device)
                 action, _, _, _ = policy.get_action(obs_tensor, deterministic=True)
                 action = action.cpu().numpy()[0]
 
-            # Step
             obs, reward, terminated, truncated, _ = env.step(action)
             total_reward += reward
             if reward > 0.5:  # Food eaten
                 food_eaten += int(reward)
 
-            # Render
             if render and step % 10 == 0:
                 print('\033[2J\033[H')  # Clear screen
                 print(f"Episode {ep + 1} | Step {step} | Food eaten: {food_eaten} | Reward: {total_reward:.2f}")

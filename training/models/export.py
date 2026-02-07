@@ -16,7 +16,6 @@ class PolicyForExport(nn.Module):
 
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
         action_mean, _, _ = self.policy.forward(obs)
-        # 6 fin actions, all sigmoid to [0, 1]
         return torch.sigmoid(action_mean)
 
 

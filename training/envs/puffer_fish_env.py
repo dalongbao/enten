@@ -5,8 +5,6 @@ from gymnasium import spaces
 
 
 class PufferFishEnv:
-    """PufferLib-native vectorized multi-fish environment."""
-
     NUM_RAYS = 16
     RAY_ARC = np.pi * 1.5  # 270 degrees
     MAX_RAY_LENGTH = 450.0
@@ -34,7 +32,6 @@ class PufferFishEnv:
         self.observation_space = spaces.Box(
             low=-1.0, high=1.0, shape=(self.single_obs_dim,), dtype=np.float32
         )
-        # 6 actions: body_freq, body_amp, left_pec_freq, left_pec_amp, right_pec_freq, right_pec_amp
         self.action_space = spaces.Box(
             low=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32),
             high=np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0], dtype=np.float32),
@@ -86,7 +83,6 @@ class PufferFishEnv:
         self._init_state_arrays()
 
     def _set_variety(self, variety: str):
-        """Set physics parameters based on goldfish variety."""
         if variety == "comet":
             self.body_length = 80.0
             self.fin_area_mult = 0.7
@@ -140,7 +136,6 @@ class PufferFishEnv:
         self.episode_lengths = np.zeros((n, m), dtype=np.int32)
 
     def reset(self, seed=None):
-        """Reset all environments. Returns observations for all agents."""
         if seed is not None:
             self.rng = np.random.default_rng(seed)
 
@@ -191,18 +186,6 @@ class PufferFishEnv:
         return self._get_obs()
 
     def step(self, actions):
-        """
-        Step all environments.
-
-        Args:
-            actions: (num_envs * num_fish, 3) array of actions
-
-        Returns:
-            observations: (num_envs * num_fish, obs_dim)
-            rewards: (num_envs * num_fish,)
-            dones: (num_envs * num_fish,)
-            infos: dict with episode statistics
-        """
         n = self.num_envs
         m = self.num_fish
 
@@ -258,7 +241,6 @@ class PufferFishEnv:
         return obs, rewards_flat, dones_flat, infos
 
     def _reset_envs(self, env_mask):
-        """Reset specified environments."""
         indices = np.where(env_mask)[0]
         n_reset = len(indices)
         if n_reset == 0:
@@ -308,24 +290,18 @@ class PufferFishEnv:
         self.episode_lengths[indices] = 0
 
     def _physics_step_fin(self, body_freq, body_amp, left_pec_freq, left_pec_amp, right_pec_freq, right_pec_amp):
-        """Fin-based physics: direct fin control drives movement."""
-        # Map normalized actions to physical parameters
         actual_body_freq = self.FIN_BODY_FREQ_MIN + body_freq * (self.FIN_BODY_FREQ_MAX - self.FIN_BODY_FREQ_MIN)
         actual_body_amp = body_amp
 
-        # === TAIL ANIMATION ===
         self.tail_phase += actual_body_freq * 2.0 * np.pi * self.dt
         self.tail_phase = self.tail_phase % (2.0 * np.pi)
 
-        # === THRUST FROM TAIL ===
         fin_area = self.body_length * self.fin_area_mult * 0.1
         thrust = self.thrust_coeff * actual_body_amp * actual_body_freq * fin_area
 
-        # Modulate by tail phase (peak thrust at mid-stroke)
         tail_pulse = np.sin(self.tail_phase) ** 2
         thrust *= (0.5 + tail_pulse * 0.5)
 
-        # === TORQUE FROM PECTORAL FINS ===
         left_pec_actual_freq = self.FIN_PEC_FREQ_MIN + left_pec_freq * (self.FIN_PEC_FREQ_MAX - self.FIN_PEC_FREQ_MIN)
         right_pec_actual_freq = self.FIN_PEC_FREQ_MIN + right_pec_freq * (self.FIN_PEC_FREQ_MAX - self.FIN_PEC_FREQ_MIN)
 
@@ -333,39 +309,31 @@ class PufferFishEnv:
         right_force = right_pec_amp * right_pec_actual_freq
         torque = (right_force - left_force) * self.FIN_PEC_LEVER_ARM
 
-        # Update angular velocity from torque
         self.angular_vel += torque / self.mass * self.dt
 
         # Angular drag to prevent spinning forever
         angular_drag = 0.95
         self.angular_vel *= np.power(angular_drag, self.dt * 60.0)
 
-        # Update angle
         self.angle += self.angular_vel * self.dt
 
-        # === BODY CURVE (based on turning) ===
         target_curve = self.angular_vel * 0.3
         self.body_curve += (target_curve - self.body_curve) * 5.0 * self.dt
 
-        # Update pectoral fin display values
         self.left_pectoral = left_pec_amp
         self.right_pectoral = right_pec_amp
 
-        # === VELOCITY UPDATE ===
         cos_a = np.cos(self.angle)
         sin_a = np.sin(self.angle)
 
-        # Thrust in facing direction (adjusted by body curve)
         thrust_angle = self.angle - self.body_curve * 0.2
         cos_thrust = np.cos(thrust_angle)
         sin_thrust = np.sin(thrust_angle)
         fx = thrust * cos_thrust
         fy = thrust * sin_thrust
 
-        # Current speed for drag calculation
         self.current_speed = np.linalg.norm(self.vel, axis=2)
 
-        # Decompose velocity into forward/lateral components
         v_forward = self.vel[:, :, 0] * cos_a + self.vel[:, :, 1] * sin_a
         v_lateral = -self.vel[:, :, 0] * sin_a + self.vel[:, :, 1] * cos_a
 
@@ -383,7 +351,6 @@ class PufferFishEnv:
         fx -= drag_x
         fy -= drag_y
 
-        # Integration
         effective_mass = self.mass * 1.3
         ax = fx / effective_mass
         ay = fy / effective_mass
@@ -392,8 +359,6 @@ class PufferFishEnv:
         self.pos[:, :, 0] += self.vel[:, :, 0] * self.dt
         self.pos[:, :, 1] += self.vel[:, :, 1] * self.dt
 
-        # === INTERNAL STATE UPDATES ===
-        # Energy cost based on fin activity
         movement_intensity = body_amp * body_freq + (left_pec_amp * left_pec_freq + right_pec_amp * right_pec_freq) * 0.5
         self.energy -= self.energy_cost_base * movement_intensity
         self.energy += self.energy_recovery_rate * (1.0 - movement_intensity) * self.dt
@@ -692,7 +657,6 @@ class PufferFishEnv:
         return rays
 
     def _sense_lateral_single(self, env_idx, fish_idx):
-        """Sense lateral line for a single fish."""
         lateral = np.zeros(self.NUM_LATERAL_SENSORS * 2, dtype=np.float32)
 
         if self.food_count[env_idx] == 0:
@@ -822,12 +786,10 @@ class PufferFishEnv:
         return rewards
 
     def _spawn_food_all(self, count):
-        """Spawn food for all environments."""
         for i in range(self.num_envs):
             self._spawn_food_single(i, count)
 
     def _spawn_food_single(self, env_idx, count):
-        """Spawn food for a single environment."""
         for _ in range(count):
             if self.food_count[env_idx] >= self.max_food:
                 break

@@ -532,7 +532,6 @@ void fish_update_particles(Fish *fish, float dt) {
   for (int i = 0; i < ps->count;) {
     Particle *p = &ps->particles[i];
 
-    // Age particle
     p->life -= decay_rate * dt;
 
     if (p->life <= 0.0f) {
@@ -544,7 +543,6 @@ void fish_update_particles(Fish *fish, float dt) {
     // Store previous position for brushstroke trail
     p->prev_pos = p->pos;
 
-    // Update position with gentle drift
     p->pos.x += p->vel.x * dt;
     p->pos.y += p->vel.y * dt;
 
@@ -552,16 +550,13 @@ void fish_update_particles(Fish *fish, float dt) {
     p->vel.x *= 0.98f;
     p->vel.y *= 0.98f;
 
-    // Update angle based on velocity
     float vel_mag = sqrtf(p->vel.x * p->vel.x + p->vel.y * p->vel.y);
     if (vel_mag > 0.1f) {
       p->angle = atan2f(p->vel.y, p->vel.x);
     }
 
-    // Fade smoothly
     p->alpha = p->life * p->life * PARTICLE_ALPHA_INITIAL;
 
-    // Length shrinks over time
     p->length *= 0.995f;
 
     i++;
@@ -573,7 +568,6 @@ void fish_update_fin(Fish *fish, const FinAction *action, float dt,
   FishState *s = &fish->state;
   const FishParams *p = &fish->params;
 
-  // Clamp action values to [0, 1]
   float body_freq = fmaxf(0.0f, fminf(1.0f, action->body_freq));
   float body_amp = fmaxf(0.0f, fminf(1.0f, action->body_amp));
   float left_pec_freq = fmaxf(0.0f, fminf(1.0f, action->left_pec_freq));
@@ -581,12 +575,10 @@ void fish_update_fin(Fish *fish, const FinAction *action, float dt,
   float right_pec_freq = fmaxf(0.0f, fminf(1.0f, action->right_pec_freq));
   float right_pec_amp = fmaxf(0.0f, fminf(1.0f, action->right_pec_amp));
 
-  // Map normalized actions to physical parameters
   float actual_body_freq =
       FIN_BODY_FREQ_MIN + body_freq * (FIN_BODY_FREQ_MAX - FIN_BODY_FREQ_MIN);
   float actual_body_amp = body_amp;
 
-  // Update tail state
   s->tail.frequency = actual_body_freq;
   s->tail.amplitude = actual_body_amp;
   s->tail.phase += actual_body_freq * 2.0f * M_PI * dt;
@@ -607,7 +599,6 @@ void fish_update_fin(Fish *fish, const FinAction *action, float dt,
   thrust *= (0.5f + tail_pulse * 0.5f);
 
   // === TORQUE FROM PECTORAL FINS ===
-  // Asymmetric pectoral motion creates torque
   float left_pec_actual_freq =
       FIN_PEC_FREQ_MIN + left_pec_freq * (FIN_PEC_FREQ_MAX - FIN_PEC_FREQ_MIN);
   float right_pec_actual_freq =
@@ -617,21 +608,17 @@ void fish_update_fin(Fish *fish, const FinAction *action, float dt,
   float right_force = right_pec_amp * right_pec_actual_freq;
   float torque = (right_force - left_force) * FIN_PEC_LEVER_ARM;
 
-  // Update angular velocity from torque
   s->angular_vel += torque / p->mass * dt;
 
   // Angular drag to prevent spinning forever
   float angular_drag = 0.95f;
   s->angular_vel *= powf(angular_drag, dt * 60.0f);
 
-  // Update angle
   s->angle += s->angular_vel * dt;
 
-  // Update body curve based on turning
   float target_curve = s->angular_vel * 0.3f;
   s->body_curve += (target_curve - s->body_curve) * 5.0f * dt;
 
-  // Update pectoral fin display values
   s->left_pectoral = left_pec_amp;
   s->right_pectoral = right_pec_amp;
 
@@ -639,16 +626,13 @@ void fish_update_fin(Fish *fish, const FinAction *action, float dt,
   float cos_a = cosf(s->angle);
   float sin_a = sinf(s->angle);
 
-  // Thrust in facing direction (adjusted by body curve)
   float thrust_angle = s->angle - s->body_curve * 0.2f;
   float fx = thrust * cosf(thrust_angle);
   float fy = thrust * sinf(thrust_angle);
 
-  // Current speed for drag calculation
   float current_speed = sqrtf(s->vel.x * s->vel.x + s->vel.y * s->vel.y);
   s->current_speed = current_speed;
 
-  // Decompose velocity into forward/lateral components
   float v_forward = s->vel.x * cos_a + s->vel.y * sin_a;
   float v_lateral = -s->vel.x * sin_a + s->vel.y * cos_a;
 
@@ -667,7 +651,6 @@ void fish_update_fin(Fish *fish, const FinAction *action, float dt,
   fx -= drag_x;
   fy -= drag_y;
 
-  // Integration
   float effective_mass = p->mass * 1.3f;
   float ax = fx / effective_mass;
   float ay = fy / effective_mass;
@@ -678,7 +661,6 @@ void fish_update_fin(Fish *fish, const FinAction *action, float dt,
   s->pos.y += s->vel.y * dt;
 
   // === INTERNAL STATE UPDATES ===
-  // Energy cost based on fin activity
   float movement_intensity =
       body_amp * body_freq +
       (left_pec_amp * left_pec_freq + right_pec_amp * right_pec_freq) * 0.5f;
